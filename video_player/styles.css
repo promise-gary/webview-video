@@ -1,0 +1,90 @@
+:root {
+  color-scheme: dark;
+  font-family: Inter, "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+.player {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  background: transparent;
+}
+
+body {
+  overflow: hidden;
+}
+
+.player {
+  position: relative;
+}
+
+canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.debug-panel {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  left: 12px;
+  padding: 10px 12px;
+  border: 1px solid rgb(255 255 255 / 16%);
+  border-radius: 8px;
+  background: rgb(10 13 18 / 82%);
+  color: #dce3ef;
+  pointer-events: none;
+}
+
+.debug-panel[hidden] {
+  display: none;
+}
+
+.debug-info,
+.cache-info {
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.cache-info {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 6px;
+  color: #9da9bc;
+}
+
+#cache-progress {
+  display: block;
+  width: 100%;
+  height: 6px;
+  margin-top: 5px;
+  overflow: hidden;
+  border: 0;
+  border-radius: 999px;
+  background: #303746;
+  accent-color: #78a6ff;
+}
+
+#cache-progress::-webkit-progress-bar {
+  border-radius: 999px;
+  background: #303746;
+}
+
+#cache-progress::-webkit-progress-value {
+  border-radius: 999px;
+  background: #78a6ff;
+}
+
+#cache-progress::-moz-progress-bar {
+  border-radius: 999px;
+  background: #78a6ff;
+}
