@@ -1,29 +1,23 @@
 /**
- * 增量 Opus → PCM → Web Audio 时钟。
- *
- * PCM 只存在内存中：既能在网络仍下载时先播放，也能在暂停恢复或重新播放时复用。
+ * 完整 Opus 解码后，为单次播放提供 Web Audio 时钟。
  */
 export class WebAudioClock {
-  constructor(stream, { onBufferChange = () => {}, onError = () => {} } = {}) {
+  constructor(stream, { onError = () => {} } = {}) {
     this.stream = stream;
-    this.onBufferChange = onBufferChange;
     this.onError = onError;
     this.audioContext = null;
     this.decoder = null;
     this.blocks = [];
     this.sources = new Set();
     this.inputEnded = false;
-    this.complete = false;
     this.durationUs = 0;
-    this.pausedTimeUs = 0;
-    this.mediaStartUs = 0;
     this.contextStartTime = 0;
     this.scheduledUntilUs = 0;
     this.playing = false;
     this.disposed = false;
   }
 
-  /** 配置 Decoder 和 AudioContext；不会触发声音，真正 resume() 在 playFrom()。 */
+  /** 配置 Decoder 和 AudioContext，不会触发声音。 */
   async initialize() {
     if (!('AudioDecoder' in window) || !('EncodedAudioChunk' in window)) {
       throw new Error('当前环境不支持 AudioDecoder。');
@@ -65,8 +59,6 @@ export class WebAudioClock {
     this._closeDecoder();
     this.blocks.sort((left, right) => left.timestamp - right.timestamp);
     this.durationUs = this.bufferedEndUs;
-    this.complete = true;
-    this.onBufferChange();
   }
 
   get bufferedEndUs() {
@@ -74,34 +66,22 @@ export class WebAudioClock {
     return last ? last.timestamp + last.duration : 0;
   }
 
-  /** 完整输入结束后已有全部 PCM；下载期间只允许读取已经解码到的时间范围。 */
-  hasBufferedThrough(timestampUs) {
-    return Boolean(this.blocks.length) && (this.complete || this.bufferedEndUs >= timestampUs);
-  }
-
   get currentTimeUs() {
-    if (!this.playing || !this.audioContext) return this.pausedTimeUs;
-    const timestampUs = this._currentAbsoluteTimeUs();
-    return this.complete && this.durationUs
-      ? Math.min(timestampUs, this.durationUs)
-      : timestampUs;
+    if (!this.playing || !this.audioContext) return 0;
+    return Math.min(this._currentAbsoluteTimeUs(), this.durationUs);
   }
 
-  /** 从指定媒体时间开始排程约 1 秒 PCM；AudioContext 是视频的主时钟。 */
-  async playFrom(timestampUs) {
+  /** 从起点排程 PCM，AudioContext 是视频的主时钟。 */
+  async start() {
     if (!this.audioContext || !this.blocks.length || this.disposed) {
-      throw new Error('音频缓冲尚未就绪。');
+      throw new Error('音频资源尚未就绪。');
     }
     await this.audioContext.resume();
     if (this.disposed) return;
 
     this._stopSources();
-    this.pausedTimeUs = this.complete
-      ? Math.min(Math.max(timestampUs, 0), this.durationUs)
-      : Math.max(timestampUs, 0);
-    this.mediaStartUs = this.pausedTimeUs;
     this.contextStartTime = this.audioContext.currentTime;
-    this.scheduledUntilUs = this.mediaStartUs;
+    this.scheduledUntilUs = 0;
     this.playing = true;
     this.schedule();
   }
@@ -110,9 +90,7 @@ export class WebAudioClock {
   schedule() {
     if (!this.playing || !this.audioContext || !this.blocks.length) return;
     const currentUs = this._currentAbsoluteTimeUs();
-    const targetUs = this.complete
-      ? Math.min(currentUs + 1_000_000, this.durationUs)
-      : currentUs + 1_000_000;
+    const targetUs = Math.min(currentUs + 1_000_000, this.durationUs);
     if (this.scheduledUntilUs < currentUs) this.scheduledUntilUs = currentUs;
 
     while (this.scheduledUntilUs < targetUs) {
@@ -133,7 +111,7 @@ export class WebAudioClock {
         this.sources.delete(source);
       };
       source.start(
-        this.contextStartTime + (this.scheduledUntilUs - this.mediaStartUs) / 1_000_000,
+        this.contextStartTime + this.scheduledUntilUs / 1_000_000,
         offsetUs / 1_000_000,
         playableUs / 1_000_000
       );
@@ -142,17 +120,16 @@ export class WebAudioClock {
     }
   }
 
-  pause() {
-    this.pausedTimeUs = this.currentTimeUs;
+  /** 播放结束、失败或销毁时停止已排程的音频。 */
+  stop() {
     this.playing = false;
     this._stopSources();
-    return this.pausedTimeUs;
   }
 
   dispose() {
     if (this.disposed) return;
     this.disposed = true;
-    this.pause();
+    this.stop();
     this._closeDecoder();
     this.blocks = [];
     if (this.audioContext && this.audioContext.state !== 'closed') void this.audioContext.close();
@@ -181,7 +158,6 @@ export class WebAudioClock {
         audioBuffer: null,
       });
       this.blocks.sort((left, right) => left.timestamp - right.timestamp);
-      this.onBufferChange();
     } catch (error) {
       this.onError(error);
     } finally {
@@ -204,9 +180,7 @@ export class WebAudioClock {
   }
 
   _currentAbsoluteTimeUs() {
-    return this.mediaStartUs + Math.round(
-      (this.audioContext.currentTime - this.contextStartTime) * 1_000_000
-    );
+    return Math.round((this.audioContext.currentTime - this.contextStartTime) * 1_000_000);
   }
 
   _stopSources() {

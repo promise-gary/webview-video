@@ -1,7 +1,4 @@
-/**
- * 仅保存压缩数据。短视频完整下载后仍保留它们，暂停恢复和重新播放时无需再次请求。
- * 已解码的 VideoFrame 不放在这里，仍由播放器维持很小的窗口并及时 close()。
- */
+/** 保存 Demux 产生的压缩媒体数据，已解码的 VideoFrame 由播放器及时释放。 */
 export class EncodedMediaStore {
   constructor() {
     this.metadata = null;
@@ -27,9 +24,5 @@ export class EncodedMediaStore {
   finish(sourceBytes) {
     this.sourceBytes = sourceBytes;
     this.complete = true;
-  }
-
-  hasVideoThrough(timestampUs) {
-    return this.complete || this.videoBufferedEndUs >= timestampUs;
   }
 }
