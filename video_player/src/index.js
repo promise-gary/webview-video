@@ -1,61 +1,31 @@
-/** 透明视频播放器的精简页面入口，只负责初始化和可选调试信息。 */
+/** 透明视频播放器的精简页面入口。 */
 import { PlayerPageConfig } from './config/player-page-config.js';
+import { LogPanel } from './lib/debug/log-panel.js';
+import { PlayerDebugPanel } from './lib/debug/player-debug-panel.js';
 import { TransparentWebmPlayer } from './lib/player/transparent-webm-player.js';
 
 const canvas = document.querySelector('#video-canvas');
-const debugPanel = document.querySelector('#debug-panel');
-const debugInfo = document.querySelector('#debug-info');
-const cacheProgress = document.querySelector('#cache-progress');
-const cacheDetail = document.querySelector('#cache-detail');
-
-let debugEnabled = false;
-
-/** 将字节换算成便于阅读的 MB，仅负责页面展示。 */
-const formatMegabytes = (bytes) => `${(bytes / 1024 / 1024).toFixed(2)} MB`;
-
-/**
- * 缓存进度表示网络资源的接收进度，不代表当前播放位置。
- * Content-Length 暂时未知时使用原生 progress 的不确定状态。
- */
-const showCacheProgress = ({ loadedBytes, totalBytes, complete }) => {
-  if (!debugEnabled) return;
-  if (!totalBytes) {
-    cacheProgress.removeAttribute('value');
-    cacheDetail.textContent = `${formatMegabytes(loadedBytes)} · 总大小未知`;
-    return;
-  }
-
-  const percent = Math.min(100, loadedBytes / totalBytes * 100);
-  cacheProgress.value = percent;
-  cacheProgress.textContent = `${percent.toFixed(1)}%`;
-  cacheDetail.textContent = complete
-    ? `${formatMegabytes(totalBytes)} · 已完成`
-    : `${formatMegabytes(loadedBytes)} / ${formatMegabytes(totalBytes)} · ${percent.toFixed(1)}%`;
-};
-
-let rendererName = '初始化中';
-
-/** Demux 每解析出一批新帧便刷新，下载完成后显示完整视频信息。 */
-const showVideoInfo = ({ width, height, fps, frames, duration }) => {
-  if (!debugEnabled) return;
-  debugInfo.textContent =
-    `${width} × ${height} · ${fps.toFixed(2)} FPS`
-    + ` · ${frames} 帧 · ${duration.toFixed(2)} 秒 · ${rendererName}`;
-};
+const debugLayer = document.querySelector('#debug-layer');
+const debugEnabled = new URL(window.location.href).searchParams.get('debug') === 'true';
+const playerDebugPanel = PlayerDebugPanel.create({
+  enabled: debugEnabled,
+  parent: debugLayer,
+});
+const logPanel = LogPanel.instance.initialize({
+  enabled: debugEnabled,
+  parent: debugLayer,
+});
 
 try {
   const pageConfig = PlayerPageConfig.fromUrl(window.location.href);
-  debugEnabled = pageConfig.debugEnabled;
-  if (debugEnabled) debugPanel.hidden = false;
 
   const player = new TransparentWebmPlayer({
     canvas,
     ...pageConfig.playerOptions,
-    onCacheProgress: showCacheProgress,
-    onVideoInfoChange: showVideoInfo,
-    onError: (error) => {
-      if (debugEnabled) debugInfo.textContent = `播放器错误：${error.message}`;
-    },
+    onCacheProgress: (progress) => playerDebugPanel.updateCache(progress),
+    onVideoInfoChange: (videoInfo) => playerDebugPanel.updateVideoInfo(videoInfo),
+    onError: (error) => playerDebugPanel.showError(error),
+    onTechnicalPath: (type, message) => logPanel.add(type, message),
   });
 
   // Player 创建的 Decoder、AudioContext、VideoFrame 和 GPU 资源必须统一释放。
@@ -63,20 +33,17 @@ try {
 
   // load() 等待首段缓冲和视频首帧预览；剩余资源会继续在后台读取和解析。
   player.load().then((info) => {
-    rendererName = info.renderer;
-    showVideoInfo(info);
-
-    if (debugEnabled && info.fallbackReason) {
-      console.info(`WebGPU 已降级为 WebGL：${info.fallbackReason}`);
-    }
+    playerDebugPanel.updateRenderer(info.renderer);
+    playerDebugPanel.updateVideoInfo(info);
 
     // Canvas 本身承接用户手势，不增加任何可见的播放控件。
     player.canvas.addEventListener('click', () => player.toggle());
   }).catch((error) => {
-    if (debugEnabled) debugInfo.textContent = `播放器加载失败：${error.message}`;
+    playerDebugPanel.showError(error);
+    logPanel.add('error', error.message);
   });
 } catch (error) {
-  debugPanel.hidden = false;
-  debugInfo.textContent = `播放器配置错误：${error.message}`;
+  playerDebugPanel.showError(error);
+  logPanel.add('error', `Player Config: ${error.message}`);
   console.error(error);
 }

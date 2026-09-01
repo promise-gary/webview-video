@@ -24,6 +24,7 @@ export class TransparentWebmPlayer {
     onVideoInfoChange = () => {},
     onError = () => {},
     onPlayingChange = () => {},
+    onTechnicalPath = () => {},
   }) {
     this.canvas = canvas;
     this.sourceUrl = sourceUrl;
@@ -33,6 +34,7 @@ export class TransparentWebmPlayer {
     this.onVideoInfoChange = onVideoInfoChange;
     this.onError = onError;
     this.onPlayingChange = onPlayingChange;
+    this.onTechnicalPath = onTechnicalPath;
     this.bufferController = new PlaybackBufferController({
       startupBufferMs,
       resumeBufferMs,
@@ -78,8 +80,10 @@ export class TransparentWebmPlayer {
    */
   async load() {
     if (!('VideoDecoder' in window) || !('EncodedVideoChunk' in window)) {
+      this._reportTechnicalPath('error', 'WebCodecs VideoDecoder Unsupported');
       throw new Error('当前环境不支持 VideoDecoder。');
     }
+    this._reportTechnicalPath('success', 'WebCodecs VideoDecoder');
 
     try {
       this.abortController = new AbortController();
@@ -99,11 +103,13 @@ export class TransparentWebmPlayer {
         this.audioClock,
         0
       ));
+      this._reportTechnicalPath('success', 'Startup Buffer Ready');
 
       this.ready = true;
       this._submitPair(this.store.frames[0]);
       return this._createLoadInfo();
     } catch (error) {
+      this._reportTechnicalPath('error', error.message);
       this.dispose();
       throw error;
     }
@@ -155,7 +161,16 @@ export class TransparentWebmPlayer {
     });
     this._notifyCacheProgress(false);
 
+    let streamStarted = false;
     for await (const bytes of this.request.read()) {
+      if (!streamStarted) {
+        streamStarted = true;
+        const fetchTechnology = this.sourceUrl.startsWith('https://')
+          ? 'HTTPS Fetch'
+          : 'HTTP Fetch';
+        this._reportTechnicalPath('success', fetchTechnology);
+        this._reportTechnicalPath('success', 'ReadableStream');
+      }
       this._acceptDemuxed(this.demuxer.append(bytes));
       this.store.sourceBytes = this.request.loadedBytes;
       this._notifyCacheProgress(false);
@@ -170,6 +185,14 @@ export class TransparentWebmPlayer {
 
   _acceptDemuxed(output) {
     this.store.append(output);
+    if (output.metadata) {
+      this._reportTechnicalPath('success', 'WebM Demux');
+      if (output.metadata.audio) this._reportTechnicalPath('success', 'Opus Track');
+    }
+    if (output.frames.length) {
+      this._reportTechnicalPath('success', 'VP9 Color Track');
+      this._reportTechnicalPath('success', 'VP9 Alpha Track');
+    }
     if (this.store.metadata) this.onVideoInfoChange(this._createVideoInfo());
     this._feedAudioChunks();
     this._notifyMediaChanged();
@@ -179,10 +202,20 @@ export class TransparentWebmPlayer {
     const metadata = this.store.metadata;
     this.canvas.width = metadata.width;
     this.canvas.height = metadata.height;
+    if (!this.webGpuEnabled) this._reportTechnicalPath('info', 'WebGPU Disabled');
     this.renderer = await RendererFactory.create(this.canvas, {
       webGpuEnabled: this.webGpuEnabled,
     });
     this.canvas = this.renderer.canvas;
+    if (this.webGpuEnabled && this.renderer.name === 'WebGL') {
+      this._reportTechnicalPath('warning', 'WebGPU Failed');
+      this._reportTechnicalPath('info', 'Fallback to WebGL');
+    }
+    this._reportTechnicalPath('success', `${this.renderer.name} Renderer`);
+    this._reportTechnicalPath(
+      'success',
+      this.renderer.name === 'WebGPU' ? 'WGSL Alpha Compose' : 'GLSL Alpha Compose'
+    );
     this.decoderConfig = await this._getDecoderConfig(
       metadata.codec,
       metadata.width,
@@ -197,10 +230,14 @@ export class TransparentWebmPlayer {
         onError: (error) => this._fail(error),
       });
       await this.audioClock.initialize();
+      this._reportTechnicalPath('success', 'Opus AudioDecoder');
+      this._reportTechnicalPath('success', 'Web Audio Clock');
       this.audioInitialized = true;
       this._feedAudioChunks();
       await this._completeAudioInput();
       this._validateDurations();
+    } else {
+      this._reportTechnicalPath('info', 'Audio Disabled');
     }
   }
 
@@ -300,6 +337,7 @@ export class TransparentWebmPlayer {
       if (!this.wantsToPlay || this.failed || this.disposed) return;
       this.playbackStartedAt = performance.now() - this.currentTimeUs / 1000;
       this.playing = true;
+      this._reportTechnicalPath('success', 'Playing');
       this.onPlayingChange(true, 'playing');
       this._decodeAhead();
       this.animationId = requestAnimationFrame(this.renderFrame);
@@ -319,6 +357,7 @@ export class TransparentWebmPlayer {
       optimizeForLatency: true,
     });
     if (!support.supported) throw new Error(`当前环境不支持 ${codec}。`);
+    this._reportTechnicalPath('success', 'VP9 Decoder Supported');
     return support.config;
   }
 
@@ -332,7 +371,9 @@ export class TransparentWebmPlayer {
       error: (error) => this._fail(error),
     });
     this.colorDecoder.configure(this.decoderConfig);
+    this._reportTechnicalPath('success', 'Color VideoDecoder');
     this.alphaDecoder.configure(this.decoderConfig);
+    this._reportTechnicalPath('success', 'Alpha VideoDecoder');
   }
 
   _submitPair(pair) {
@@ -362,6 +403,7 @@ export class TransparentWebmPlayer {
     this.partialPairs.set(frame.timestamp, pair);
     if (!pair.color || !pair.alpha) return;
 
+    this._reportTechnicalPath('success', 'Color + Alpha Pair');
     this.partialPairs.delete(frame.timestamp);
     this.pairsInFlight = Math.max(0, this.pairsInFlight - 1);
     this.decodedPairs.push(pair);
@@ -437,6 +479,7 @@ export class TransparentWebmPlayer {
   _drawPair(pair) {
     this.renderingPairs += 1;
     this.renderer.render(pair)
+      .then(() => this._reportTechnicalPath('success', 'First Frame Rendered'))
       .catch((error) => this._fail(error))
       .finally(() => {
         TransparentWebmPlayer._closePair(pair);
@@ -488,6 +531,7 @@ export class TransparentWebmPlayer {
     this._closeDecoders();
     this._resolveWaiters();
     this.onPlayingChange(false, 'failed');
+    this._reportTechnicalPath('error', error.message);
     this.onError(error);
     console.error(error);
   }
@@ -506,6 +550,10 @@ export class TransparentWebmPlayer {
     for (const decoder of [this.colorDecoder, this.alphaDecoder]) {
       if (decoder && decoder.state !== 'closed') decoder.close();
     }
+  }
+
+  _reportTechnicalPath(type, message) {
+    this.onTechnicalPath(type, message);
   }
 
   static _closePair(pair) {

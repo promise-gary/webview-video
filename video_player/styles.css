@@ -31,27 +31,43 @@ canvas {
   object-fit: contain;
 }
 
-.debug-panel {
+.debug-layer {
   position: absolute;
-  right: 12px;
-  bottom: 12px;
-  left: 12px;
+  top: max(12px, env(safe-area-inset-top));
+  right: max(12px, env(safe-area-inset-right));
+  bottom: max(12px, env(safe-area-inset-bottom));
+  left: max(12px, env(safe-area-inset-left));
+  z-index: 2147483647;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.debug-layer[hidden],
+.player-debug-panel[hidden] {
+  display: none;
+}
+
+.player-debug-panel {
+  flex: 0 0 auto;
+  width: 100%;
   padding: 10px 12px;
   border: 1px solid rgb(255 255 255 / 16%);
   border-radius: 8px;
   background: rgb(10 13 18 / 82%);
   color: #dce3ef;
-  pointer-events: none;
-}
-
-.debug-panel[hidden] {
-  display: none;
 }
 
 .debug-info,
 .cache-info {
   font-size: 12px;
   line-height: 1.5;
+}
+
+.debug-info.error {
+  color: #fca5a5;
 }
 
 .cache-info {
