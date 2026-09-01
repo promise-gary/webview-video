@@ -15,7 +15,15 @@ npm start
 - `GET http://127.0.0.1:4173/video`
 - `HEAD http://127.0.0.1:4173/video`
 
-`/video` 使用普通 `200` 响应持续传输 WebM，并支持跨域请求。
+`/video` 每次请求都会从 `videos/` 中随机选择一个 `.webm` 文件，以普通 `200` 响应原样持续传输，并支持跨域请求。`HEAD /video` 会随机选择文件并返回该文件的大小。
+
+当前示例资源：
+
+```text
+videos/1.webm
+videos/2.webm
+videos/3.webm
+```
 
 ## Render 配置
 

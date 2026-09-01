@@ -1,6 +1,7 @@
 import { createReadStream } from 'node:fs';
-import { stat } from 'node:fs/promises';
+import { readdir, stat } from 'node:fs/promises';
 import { createServer } from 'node:http';
+import { join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { fileURLToPath } from 'node:url';
 
@@ -9,13 +10,30 @@ const HOST = '0.0.0.0';
 const DEFAULT_PORT = 4173;
 
 // 视频和服务端放在同一个独立仓库内，不依赖原项目中的任何文件。
-const VIDEO_PATH = fileURLToPath(
-  new URL('./videos/liquid-transition-01-vp9-alpha-opus.webm', import.meta.url),
-);
+const VIDEO_DIRECTORY = fileURLToPath(new URL('./videos/', import.meta.url));
 
-async function writeVideoFile(response) {
+const videoFilesPromise = readdir(VIDEO_DIRECTORY, { withFileTypes: true }).then((entries) => {
+  const videoFiles = entries
+    .filter((entry) => entry.isFile() && /\.webm$/i.test(entry.name))
+    .map((entry) => entry.name)
+    .sort((left, right) => left.localeCompare(right, undefined, { numeric: true }));
+
+  if (videoFiles.length === 0) {
+    throw new Error(`videos 目录中没有找到 WebM 文件：${VIDEO_DIRECTORY}`);
+  }
+
+  return videoFiles;
+});
+
+async function pickRandomVideoPath() {
+  const videoFiles = await videoFilesPromise;
+  const randomIndex = Math.floor(Math.random() * videoFiles.length);
+  return join(VIDEO_DIRECTORY, videoFiles[randomIndex]);
+}
+
+async function writeVideoFile(response, videoPath) {
   try {
-    await pipeline(createReadStream(VIDEO_PATH), response);
+    await pipeline(createReadStream(videoPath), response);
   } catch (error) {
     // 浏览器取消请求属于正常媒体加载行为，不需要作为服务端错误输出。
     if (response.destroyed || error?.code === 'ERR_STREAM_PREMATURE_CLOSE') return;
@@ -24,7 +42,8 @@ async function writeVideoFile(response) {
 }
 
 async function serveVideo(request, response) {
-  const videoStats = await stat(VIDEO_PATH);
+  const videoPath = await pickRandomVideoPath();
+  const videoStats = await stat(videoPath);
   response.writeHead(200, {
     'Content-Type': 'video/webm',
     'Content-Length': videoStats.size,
@@ -34,14 +53,14 @@ async function serveVideo(request, response) {
     'Access-Control-Expose-Headers': 'Content-Length',
   });
 
-  console.log(`[video] status=200 bytes=${videoStats.size}`);
+  console.log(`[video] status=200 file=${videoPath.split('/').at(-1)} bytes=${videoStats.size}`);
 
   if (request.method === 'HEAD') {
     response.end();
     return;
   }
 
-  await writeVideoFile(response);
+  await writeVideoFile(response, videoPath);
 }
 
 const server = createServer(async (request, response) => {
@@ -101,5 +120,7 @@ const port = Number.isFinite(configuredPort) ? configuredPort : DEFAULT_PORT;
 server.listen(port, HOST, () => {
   console.log(`Transparent video resource server: http://${HOST}:${port}`);
   console.log(`Video endpoint: /video`);
-  console.log(`Video source: ${VIDEO_PATH}`);
+  videoFilesPromise
+    .then((videoFiles) => console.log(`Video sources: ${videoFiles.join(', ')}`))
+    .catch((error) => console.error(`[video] ${error.message}`));
 });
