@@ -1,57 +1,46 @@
 import { WebAudioClock } from '../audio/web-audio-clock.js';
-import { IncrementalWebmDemuxer } from '../demuxers/incremental-webm-demuxer.js';
+import { WebmDemuxer } from '../demuxers/webm-demuxer.js';
 import { RendererFactory } from '../renderers/renderer-factory.js';
-import { FetchStreamRequest } from '../../network/fetch-stream-request.js';
 import { EncodedMediaStore } from '../../store/encoded-media-store.js';
-import { PlaybackBufferController } from './playback-buffer-controller.js';
 
-const MAX_BUFFERED_PAIRS = 8;
+// 这是解码/渲染执行窗口，不是网络缓冲。它只限制同时存活的 VideoFrame 数量。
+const MAX_DECODED_PAIRS = 8;
 const AUDIO_DURATION_TOLERANCE_US = 50_000;
+const NOOP = () => {};
 
 /**
- * 透明 WebM 播放器：持续读取单个 WebM 响应，增量完成 Demux、双 VideoDecoder
- * 和 WebGPU/WebGL 合成。所有媒体缓存只存在内存，dispose() 时统一释放。
+ * 一次性透明 WebM 播放器。
+ *
+ * load() 只接受完整媒体数据；播放器本身没有 URL、Fetch、流式输入或再缓冲状态。
+ * 每一份媒体创建一个实例，播放结束后由页面 Session Controller 统一 dispose()。
  */
 export class TransparentWebmPlayer {
   constructor({
     canvas,
-    sourceUrl,
-    startupBufferMs = 500,
-    resumeBufferMs = 300,
-    audioEnabled = false,
+    audioEnabled = true,
     webGpuEnabled = true,
-    onCacheProgress = () => {},
-    onVideoInfoChange = () => {},
-    onError = () => {},
-    onPlayingChange = () => {},
-    onTechnicalPath = () => {},
+    onVideoInfoChange = NOOP,
+    onError = NOOP,
+    onPlaying = NOOP,
+    onEnded = NOOP,
+    onTechnicalPath = NOOP,
   }) {
     this.canvas = canvas;
-    this.sourceUrl = sourceUrl;
     this.audioEnabled = audioEnabled;
     this.webGpuEnabled = webGpuEnabled;
-    this.onCacheProgress = onCacheProgress;
     this.onVideoInfoChange = onVideoInfoChange;
     this.onError = onError;
-    this.onPlayingChange = onPlayingChange;
+    this.onPlaying = onPlaying;
+    this.onEnded = onEnded;
     this.onTechnicalPath = onTechnicalPath;
-    this.bufferController = new PlaybackBufferController({
-      startupBufferMs,
-      resumeBufferMs,
-      audioEnabled,
-    });
 
+    this.store = new EncodedMediaStore();
     this.renderer = null;
     this.decoderConfig = null;
     this.colorDecoder = null;
     this.alphaDecoder = null;
     this.audioClock = null;
-    this.demuxer = null;
-    this.request = null;
-    this.abortController = null;
-    this.store = new EncodedMediaStore();
     this.nextPairIndex = 0;
-    this.nextAudioIndex = 0;
 
     this.partialPairs = new Map();
     this.decodedPairs = [];
@@ -60,142 +49,119 @@ export class TransparentWebmPlayer {
     this.currentTimeUs = 0;
     this.playbackStartedAt = 0;
     this.animationId = 0;
-    this.waiters = [];
 
     this.playing = false;
-    this.wantsToPlay = false;
     this.starting = false;
+    this.started = false;
     this.ready = false;
     this.failed = false;
     this.disposed = false;
-    this.loadingError = null;
-    this.audioInitialized = false;
-    this.audioEnded = false;
+    this.firstFrameRendered = false;
+    this.firstFrameResolve = null;
+    this.firstFrameReject = null;
     this.renderFrame = (now) => this._render(now);
   }
 
   /**
-   * load() 在“可开始播放”时返回；剩余资源仍会在后台持续读取和解析。
-   * 因此页面无需等待整个短视频完成下载，仍可在首段缓冲就绪后显示首帧。
+   * 完整解析媒体、初始化解码和渲染，并等待首帧真正画到 Canvas 后返回。
+   * 该返回点就是 Bridge 的 loaded 语义，不再表示“启动缓冲已满足”。
    */
-  async load() {
-    if (!('VideoDecoder' in window) || !('EncodedVideoChunk' in window)) {
-      this._reportTechnicalPath('error', 'WebCodecs VideoDecoder Unsupported');
-      throw new Error('当前环境不支持 VideoDecoder。');
-    }
-    this._reportTechnicalPath('success', 'WebCodecs VideoDecoder');
+  async load(mediaData) {
+    if (this.disposed) throw new Error('播放器已释放。');
+    if (this.ready || this.store.metadata) throw new Error('播放器已经加载过媒体。');
 
     try {
-      this.abortController = new AbortController();
-      this.demuxer = new IncrementalWebmDemuxer();
-      this.loadingPromise = this._loadResource().catch((error) => {
-        if (!this.disposed) {
-          this.loadingError = error;
-          this._notifyMediaChanged();
-          this._fail(error);
-        }
-      });
+      if (!('VideoDecoder' in window) || !('EncodedVideoChunk' in window)) {
+        throw new Error('当前环境不支持 VideoDecoder。');
+      }
+      this._reportTechnicalPath('success', 'WebCodecs VideoDecoder');
+      const mediaBuffer = TransparentWebmPlayer._toArrayBuffer(mediaData);
+      const media = WebmDemuxer.parse(mediaBuffer);
+      this.store.load(media, mediaBuffer.byteLength);
+      this._reportTechnicalPath('success', 'Complete WebM Data');
+      this._reportTechnicalPath('success', 'WebM Demux');
+      this._reportTechnicalPath('success', 'VP9 Color Track');
+      this._reportTechnicalPath('success', 'VP9 Alpha Track');
+      if (media.audio) this._reportTechnicalPath('success', 'Opus Track');
 
-      await this._waitFor(() => Boolean(this.store.metadata));
+      this.onVideoInfoChange(this._createVideoInfo());
       await this._initializeMedia();
-      await this._waitFor(() => this.bufferController.canStart(
-        this.store,
-        this.audioClock,
-        0
-      ));
-      this._reportTechnicalPath('success', 'Startup Buffer Ready');
-
       this.ready = true;
+
+      const firstFrameReady = new Promise((resolve, reject) => {
+        this.firstFrameResolve = resolve;
+        this.firstFrameReject = reject;
+      });
       this._submitPair(this.store.frames[0]);
+      await firstFrameReady;
       return this._createLoadInfo();
     } catch (error) {
-      this._reportTechnicalPath('error', error.message);
+      this._fail(error);
       this.dispose();
       throw error;
     }
   }
 
-  toggle() {
-    if (this.wantsToPlay || this.playing) this.pause();
-    else void this.play();
+  /** 从 0 开始一次性播放；启动后不提供暂停、恢复或内部重播。 */
+  async start() {
+    if (!this.ready || this.failed || this.disposed) {
+      throw new Error('播放器尚未就绪或已经释放。');
+    }
+    if (this.started || this.starting || this.playing) return;
+
+    this.started = true;
+    this.starting = true;
+    try {
+      await this.audioClock?.start();
+      if (this.failed || this.disposed) return;
+      this.playbackStartedAt = performance.now();
+      this.playing = true;
+      this._reportTechnicalPath('success', 'Playing');
+      this.onPlaying();
+      // 宿主可能在 playing 事件中同步 clear/replace，不能再为旧 Session 启动 rAF。
+      if (this.failed || this.disposed) return;
+      this._decodeAhead();
+      this.animationId = requestAnimationFrame(this.renderFrame);
+    } catch (error) {
+      const playbackError = new Error(`音频播放失败：${error.message}`);
+      this._fail(playbackError);
+      throw playbackError;
+    } finally {
+      this.starting = false;
+    }
   }
 
-  /** 用户点击后才恢复 AudioContext，满足浏览器自动播放策略。 */
-  async play() {
-    if (!this.ready || this.failed || this.disposed) return;
-    if (this.store.complete && this.currentTimeUs >= this._getDurationUs()) this._prepareReplay();
-    this.wantsToPlay = true;
-    await this._startPlayback();
-  }
-
-  pause() {
-    if (!this.wantsToPlay && !this.playing) return;
-    this.wantsToPlay = false;
-    this.currentTimeUs = this._readClock(performance.now());
-    this.playing = false;
-    this.audioClock?.pause();
-    cancelAnimationFrame(this.animationId);
-    this.animationId = 0;
-    this._drawThrough(this.currentTimeUs);
-    this.onPlayingChange(false, 'paused');
-  }
-
+  /**
+   * 幂等释放本视频拥有的全部显式资源，并断开完整媒体 ArrayBuffer 的引用。
+   * JS Heap 的实际归还时机由 WebView 的垃圾回收器决定。
+   */
   dispose() {
     if (this.disposed) return;
     this.disposed = true;
+    this.ready = false;
     this.playing = false;
-    this.wantsToPlay = false;
-    this.abortController?.abort();
     cancelAnimationFrame(this.animationId);
-    this._resolveWaiters();
+    this.animationId = 0;
+
+    this.firstFrameReject?.(new Error('播放器在首帧渲染前已释放。'));
+    this.firstFrameResolve = null;
+    this.firstFrameReject = null;
     this.audioClock?.dispose();
     this._closeBufferedFrames();
     this._closeDecoders();
     this.renderer?.destroy();
-  }
+    this.store.clear();
 
-  async _loadResource() {
-    this.request = new FetchStreamRequest({
-      sourceUrl: this.sourceUrl,
-      signal: this.abortController.signal,
-    });
-    this._notifyCacheProgress(false);
-
-    let streamStarted = false;
-    for await (const bytes of this.request.read()) {
-      if (!streamStarted) {
-        streamStarted = true;
-        const fetchTechnology = this.sourceUrl.startsWith('https://')
-          ? 'HTTPS Fetch'
-          : 'HTTP Fetch';
-        this._reportTechnicalPath('success', fetchTechnology);
-        this._reportTechnicalPath('success', 'ReadableStream');
-      }
-      this._acceptDemuxed(this.demuxer.append(bytes));
-      this.store.sourceBytes = this.request.loadedBytes;
-      this._notifyCacheProgress(false);
-    }
-    this._acceptDemuxed(this.demuxer.finish());
-    this.store.finish(this.request.loadedBytes);
-    this._notifyCacheProgress(true);
-    await this._completeAudioInput();
-    this._validateDurations();
-    this._notifyMediaChanged();
-  }
-
-  _acceptDemuxed(output) {
-    this.store.append(output);
-    if (output.metadata) {
-      this._reportTechnicalPath('success', 'WebM Demux');
-      if (output.metadata.audio) this._reportTechnicalPath('success', 'Opus Track');
-    }
-    if (output.frames.length) {
-      this._reportTechnicalPath('success', 'VP9 Color Track');
-      this._reportTechnicalPath('success', 'VP9 Alpha Track');
-    }
-    if (this.store.metadata) this.onVideoInfoChange(this._createVideoInfo());
-    this._feedAudioChunks();
-    this._notifyMediaChanged();
+    this.audioClock = null;
+    this.colorDecoder = null;
+    this.alphaDecoder = null;
+    this.renderer = null;
+    this.decoderConfig = null;
+    this.onVideoInfoChange = NOOP;
+    this.onError = NOOP;
+    this.onPlaying = NOOP;
+    this.onEnded = NOOP;
+    this.onTechnicalPath = NOOP;
   }
 
   async _initializeMedia() {
@@ -206,6 +172,7 @@ export class TransparentWebmPlayer {
     this.renderer = await RendererFactory.create(this.canvas, {
       webGpuEnabled: this.webGpuEnabled,
     });
+    // RendererFactory 在 WebGPU 初始化后失败时可能替换 Canvas。
     this.canvas = this.renderer.canvas;
     if (this.webGpuEnabled && this.renderer.name === 'WebGL') {
       this._reportTechnicalPath('warning', 'WebGPU Failed');
@@ -223,87 +190,38 @@ export class TransparentWebmPlayer {
     );
     this._createDecoders();
 
-    if (this.audioEnabled) {
-      if (!metadata.audio) throw new Error('启用音频时，WebM 必须包含 Opus 音轨。');
-      this.audioClock = new WebAudioClock(metadata.audio, {
-        onBufferChange: () => this._notifyMediaChanged(),
-        onError: (error) => this._fail(error),
-      });
-      await this.audioClock.initialize();
-      this._reportTechnicalPath('success', 'Opus AudioDecoder');
-      this._reportTechnicalPath('success', 'Web Audio Clock');
-      this.audioInitialized = true;
-      this._feedAudioChunks();
-      await this._completeAudioInput();
-      this._validateDurations();
-    } else {
+    if (!this.audioEnabled) {
       this._reportTechnicalPath('info', 'Audio Disabled');
-    }
-  }
-
-  _feedAudioChunks() {
-    if (!this.audioInitialized || !this.audioClock) return;
-    while (this.nextAudioIndex < this.store.audioChunks.length) {
-      this.audioClock.append(this.store.audioChunks[this.nextAudioIndex]);
-      this.nextAudioIndex += 1;
-    }
-  }
-
-  async _completeAudioInput() {
-    if (
-      !this.audioEnabled
-      || !this.store.complete
-      || !this.audioInitialized
-      || !this.audioClock
-      || this.audioEnded
-    ) {
       return;
     }
-    this.audioEnded = true;
+    if (!metadata.audio) throw new Error('启用音频时，WebM 必须包含 Opus 音轨。');
+
+    this.audioClock = new WebAudioClock(metadata.audio, {
+      onError: (error) => this._fail(error),
+    });
+    await this.audioClock.initialize();
+    this._reportTechnicalPath('success', 'Opus AudioDecoder');
+    this._reportTechnicalPath('success', 'Web Audio Clock');
+
+    // 媒体已经完整，所有 Opus packet 一次送入并立即 flush，不存在后续缓冲输入。
+    for (const chunk of this.store.audioChunks) this.audioClock.append(chunk);
     await this.audioClock.end();
+    this._validateDurations();
   }
 
   _validateDurations() {
-    if (!this.audioClock?.durationUs || !this.store.videoBufferedEndUs) return;
-    if (Math.abs(this.audioClock.durationUs - this.store.videoBufferedEndUs) > AUDIO_DURATION_TOLERANCE_US) {
+    if (!this.audioClock?.durationUs || !this.store.videoDurationUs) return;
+    if (Math.abs(this.audioClock.durationUs - this.store.videoDurationUs) > AUDIO_DURATION_TOLERANCE_US) {
       throw new Error(
-        `音视频时长不一致：视频 ${this.store.videoBufferedEndUs}μs，音频 ${this.audioClock.durationUs}μs。`
+        `音视频时长不一致：视频 ${this.store.videoDurationUs}μs，音频 ${this.audioClock.durationUs}μs。`
       );
     }
-  }
-
-  async _waitFor(predicate) {
-    while (!predicate()) {
-      if (this.loadingError) throw this.loadingError;
-      if (this.disposed) throw new Error('播放器已释放。');
-      await new Promise((resolve) => this.waiters.push(resolve));
-    }
-  }
-
-  _notifyMediaChanged() {
-    this._resolveWaiters();
-    if (this.wantsToPlay && this.ready && !this.playing) void this._startPlayback();
-  }
-
-  /** 向页面报告网络缓存字节数；它和媒体播放进度是两套独立状态。 */
-  _notifyCacheProgress(complete) {
-    this.onCacheProgress({
-      loadedBytes: this.request?.loadedBytes ?? 0,
-      totalBytes: this.request?.totalBytes ?? 0,
-      complete,
-    });
-  }
-
-  _resolveWaiters() {
-    const waiters = this.waiters.splice(0);
-    for (const resolve of waiters) resolve();
   }
 
   _createLoadInfo() {
     return {
       ...this._createVideoInfo(),
       sourceBytes: this.store.sourceBytes,
-      downloadComplete: this.store.complete,
       renderer: this.renderer.name,
       fallbackReason: this.renderer.fallbackReason ?? '',
       audioEnabled: Boolean(this.audioClock),
@@ -311,7 +229,7 @@ export class TransparentWebmPlayer {
   }
 
   _createVideoInfo() {
-    const durationUs = this.store.videoBufferedEndUs;
+    const durationUs = this.store.videoDurationUs;
     return {
       width: this.store.metadata.width,
       height: this.store.metadata.height,
@@ -319,33 +237,6 @@ export class TransparentWebmPlayer {
       fps: durationUs ? this.store.frames.length / (durationUs / 1_000_000) : 0,
       duration: durationUs / 1_000_000,
     };
-  }
-
-  async _startPlayback() {
-    if (
-      this.starting
-      || this.playing
-      || !this.wantsToPlay
-      || !this.bufferController.canContinue(this.store, this.audioClock, this.currentTimeUs)
-    ) {
-      return;
-    }
-
-    this.starting = true;
-    try {
-      await this.audioClock?.playFrom(this.currentTimeUs);
-      if (!this.wantsToPlay || this.failed || this.disposed) return;
-      this.playbackStartedAt = performance.now() - this.currentTimeUs / 1000;
-      this.playing = true;
-      this._reportTechnicalPath('success', 'Playing');
-      this.onPlayingChange(true, 'playing');
-      this._decodeAhead();
-      this.animationId = requestAnimationFrame(this.renderFrame);
-    } catch (error) {
-      this._fail(new Error(`音频播放失败：${error.message}`));
-    } finally {
-      this.starting = false;
-    }
   }
 
   async _getDecoderConfig(codec, width, height) {
@@ -403,12 +294,12 @@ export class TransparentWebmPlayer {
     this.partialPairs.set(frame.timestamp, pair);
     if (!pair.color || !pair.alpha) return;
 
-    this._reportTechnicalPath('success', 'Color + Alpha Pair');
     this.partialPairs.delete(frame.timestamp);
     this.pairsInFlight = Math.max(0, this.pairsInFlight - 1);
     this.decodedPairs.push(pair);
     this.decodedPairs.sort((left, right) => left.timestamp - right.timestamp);
-    if (!this.playing && this.currentTimeUs === 0) this._drawThrough(0);
+    // 首帧时间戳不一定严格为 0，loaded 仍必须等待这对帧完成实际渲染。
+    if (!this.playing && !this.firstFrameRendered) this._drawThrough(pair.timestamp);
   }
 
   _decodeAhead() {
@@ -422,7 +313,7 @@ export class TransparentWebmPlayer {
     try {
       while (
         this.nextPairIndex < this.store.frames.length
-        && this.decodedPairs.length + this.pairsInFlight + this.renderingPairs < MAX_BUFFERED_PAIRS
+        && this.decodedPairs.length + this.pairsInFlight + this.renderingPairs < MAX_DECODED_PAIRS
       ) {
         this._submitPair(this.store.frames[this.nextPairIndex]);
       }
@@ -432,17 +323,12 @@ export class TransparentWebmPlayer {
   }
 
   _render(now) {
-    if (!this.playing || this.failed) return;
+    if (!this.playing || this.failed || this.disposed) return;
     this.audioClock?.schedule();
     this.currentTimeUs = this._readClock(now);
 
-    if (this.store.complete && this.currentTimeUs >= this._getDurationUs()) {
+    if (this.currentTimeUs >= this._getDurationUs()) {
       this._finishPlayback();
-      return;
-    }
-
-    if (!this.bufferController.canContinue(this.store, this.audioClock, this.currentTimeUs)) {
-      this._pauseForBuffering();
       return;
     }
 
@@ -455,16 +341,7 @@ export class TransparentWebmPlayer {
     const timestampUs = this.audioClock
       ? this.audioClock.currentTimeUs
       : (now - this.playbackStartedAt) * 1000;
-    const maximum = this.store.complete ? this.store.videoBufferedEndUs : Number.POSITIVE_INFINITY;
-    return Math.min(Math.max(timestampUs, 0), maximum);
-  }
-
-  _pauseForBuffering() {
-    this.currentTimeUs = this._readClock(performance.now());
-    this.playing = false;
-    this.audioClock?.pause();
-    this.animationId = 0;
-    this.onPlayingChange(false, 'buffering');
+    return Math.min(Math.max(timestampUs, 0), this._getDurationUs());
   }
 
   _drawThrough(timestampUs) {
@@ -479,7 +356,15 @@ export class TransparentWebmPlayer {
   _drawPair(pair) {
     this.renderingPairs += 1;
     this.renderer.render(pair)
-      .then(() => this._reportTechnicalPath('success', 'First Frame Rendered'))
+      .then(() => {
+        if (!this.firstFrameRendered) {
+          this.firstFrameRendered = true;
+          this._reportTechnicalPath('success', 'First Frame Rendered');
+          this.firstFrameResolve?.();
+          this.firstFrameResolve = null;
+          this.firstFrameReject = null;
+        }
+      })
       .catch((error) => this._fail(error))
       .finally(() => {
         TransparentWebmPlayer._closePair(pair);
@@ -488,49 +373,35 @@ export class TransparentWebmPlayer {
       });
   }
 
-  /** 播放完成后保留压缩数据，再次点击时只重置 Decoder 和帧索引。 */
-  _prepareReplay() {
-    this.colorDecoder.reset();
-    this.alphaDecoder.reset();
-    this.colorDecoder.configure(this.decoderConfig);
-    this.alphaDecoder.configure(this.decoderConfig);
-    this._closeBufferedFrames();
-    this.nextPairIndex = 0;
-    this.pairsInFlight = 0;
-    this.currentTimeUs = 0;
-    this.playbackStartedAt = 0;
-  }
-
-  /** 到达媒体末尾时停止音视频，不自动循环；最后一帧继续留在 Canvas 上。 */
+  /** 到达末尾只报告 ended；Session Controller 随后销毁本实例，不保留重播数据。 */
   _finishPlayback() {
     const durationUs = this._getDurationUs();
     this.currentTimeUs = durationUs;
     this._drawThrough(durationUs);
     this.playing = false;
-    this.wantsToPlay = false;
-    this.audioClock?.pause();
+    this.audioClock?.stop();
     this.animationId = 0;
-    this.onPlayingChange(false, 'ended');
+    this.onEnded();
   }
 
   _getDurationUs() {
     return this.audioClock?.durationUs
-      ? Math.min(this.audioClock.durationUs, this.store.videoBufferedEndUs)
-      : this.store.videoBufferedEndUs;
+      ? Math.min(this.audioClock.durationUs, this.store.videoDurationUs)
+      : this.store.videoDurationUs;
   }
 
   _fail(error) {
     if (this.failed || this.disposed) return;
     this.failed = true;
     this.playing = false;
-    this.wantsToPlay = false;
     cancelAnimationFrame(this.animationId);
     this.animationId = 0;
-    this.audioClock?.pause();
+    this.audioClock?.stop();
     this._closeBufferedFrames();
     this._closeDecoders();
-    this._resolveWaiters();
-    this.onPlayingChange(false, 'failed');
+    this.firstFrameReject?.(error);
+    this.firstFrameResolve = null;
+    this.firstFrameReject = null;
     this._reportTechnicalPath('error', error.message);
     this.onError(error);
     console.error(error);
@@ -554,6 +425,13 @@ export class TransparentWebmPlayer {
 
   _reportTechnicalPath(type, message) {
     this.onTechnicalPath(type, message);
+  }
+
+  static _toArrayBuffer(mediaData) {
+    if (mediaData instanceof ArrayBuffer) return mediaData;
+    if (!ArrayBuffer.isView(mediaData)) throw new Error('媒体数据必须是完整的二进制数据。');
+    const bytes = new Uint8Array(mediaData.buffer, mediaData.byteOffset, mediaData.byteLength);
+    return bytes.slice().buffer;
   }
 
   static _closePair(pair) {

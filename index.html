@@ -8,18 +8,13 @@
   </head>
   <body>
     <main class="player">
-      <canvas id="video-canvas" aria-label="透明视频画面">
+      <canvas id="video-canvas" width="1" height="1" aria-label="透明视频画面">
         当前环境不支持 Canvas。
       </canvas>
 
       <div id="debug-layer" class="debug-layer" hidden>
         <aside id="player-debug-panel" class="player-debug-panel" hidden>
-          <div id="debug-info" class="debug-info">正在读取视频信息…</div>
-          <div class="cache-info">
-            <span>缓存</span>
-            <span id="cache-detail">等待下载…</span>
-          </div>
-          <progress id="cache-progress" max="100" value="0">0%</progress>
+          <div id="debug-info" class="debug-info">等待宿主应用传入完整媒体…</div>
         </aside>
       </div>
     </main>

@@ -56,9 +56,8 @@ const FALLBACK_FRAME_DURATION_US = 1_000_000 / 30;
 const FALLBACK_AUDIO_DURATION_US = 20_000;
 
 /**
- * WebM Element 的底层解析工具，并保留完整文件 parse() 作为校验入口。
- * 正式播放器使用 IncrementalWebmDemuxer 持续喂入字节；它复用本类的轨道、
- * Cluster、Block 和 EBML 读取逻辑，避免两套容器规则逐渐分叉。
+ * 完整 WebM 文件的解析工具。宿主应用传输全部字节并确认结束后，播放器才调用
+ * parse()；播放阶段不会再等待或追加媒体数据。
  *
  * WebM Alpha 的物理结构是：
  *

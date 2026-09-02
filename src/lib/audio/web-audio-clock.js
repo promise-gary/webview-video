@@ -1,29 +1,21 @@
-/**
- * 增量 Opus → PCM → Web Audio 时钟。
- *
- * PCM 只存在内存中：既能在网络仍下载时先播放，也能在暂停恢复或重新播放时复用。
- */
+/** 完整 Opus 音轨 → PCM → Web Audio 播放时钟。 */
 export class WebAudioClock {
-  constructor(stream, { onBufferChange = () => {}, onError = () => {} } = {}) {
+  constructor(stream, { onError = () => {} } = {}) {
     this.stream = stream;
-    this.onBufferChange = onBufferChange;
     this.onError = onError;
     this.audioContext = null;
     this.decoder = null;
     this.blocks = [];
     this.sources = new Set();
     this.inputEnded = false;
-    this.complete = false;
     this.durationUs = 0;
-    this.pausedTimeUs = 0;
-    this.mediaStartUs = 0;
     this.contextStartTime = 0;
     this.scheduledUntilUs = 0;
     this.playing = false;
     this.disposed = false;
   }
 
-  /** 配置 Decoder 和 AudioContext；不会触发声音，真正 resume() 在 playFrom()。 */
+  /** 配置 Decoder 和 AudioContext；不会触发声音，真正 resume() 在 start()。 */
   async initialize() {
     if (!('AudioDecoder' in window) || !('EncodedAudioChunk' in window)) {
       throw new Error('当前环境不支持 AudioDecoder。');
@@ -46,7 +38,7 @@ export class WebAudioClock {
     this.decoder.configure(support.config);
   }
 
-  /** 每个 WebM Opus packet 到达后立即送入 AudioDecoder。 */
+  /** 把完整音轨中的一个 WebM Opus packet 送入 AudioDecoder。 */
   append(chunk) {
     if (!this.decoder || this.inputEnded || this.disposed) return;
     this.decoder.decode(new EncodedAudioChunk({
@@ -57,51 +49,38 @@ export class WebAudioClock {
     }));
   }
 
-  /** 输入结束时 flush 最后几个 Opus packet，并确定完整音频时长。 */
+  /** 所有 packet 提交后 flush，并确定完整音频时长。 */
   async end() {
     if (!this.decoder || this.inputEnded) return;
     this.inputEnded = true;
     await this.decoder.flush();
     this._closeDecoder();
     this.blocks.sort((left, right) => left.timestamp - right.timestamp);
-    this.durationUs = this.bufferedEndUs;
-    this.complete = true;
-    this.onBufferChange();
+    this.durationUs = this.decodedEndUs;
   }
 
-  get bufferedEndUs() {
+  get decodedEndUs() {
     const last = this.blocks.at(-1);
     return last ? last.timestamp + last.duration : 0;
   }
 
-  /** 完整输入结束后已有全部 PCM；下载期间只允许读取已经解码到的时间范围。 */
-  hasBufferedThrough(timestampUs) {
-    return Boolean(this.blocks.length) && (this.complete || this.bufferedEndUs >= timestampUs);
-  }
-
   get currentTimeUs() {
-    if (!this.playing || !this.audioContext) return this.pausedTimeUs;
+    if (!this.playing || !this.audioContext) return 0;
     const timestampUs = this._currentAbsoluteTimeUs();
-    return this.complete && this.durationUs
-      ? Math.min(timestampUs, this.durationUs)
-      : timestampUs;
+    return this.durationUs ? Math.min(timestampUs, this.durationUs) : timestampUs;
   }
 
-  /** 从指定媒体时间开始排程约 1 秒 PCM；AudioContext 是视频的主时钟。 */
-  async playFrom(timestampUs) {
+  /** 从 0 开始一次性播放，AudioContext 同时作为视频主时钟。 */
+  async start() {
     if (!this.audioContext || !this.blocks.length || this.disposed) {
-      throw new Error('音频缓冲尚未就绪。');
+      throw new Error('完整音频数据尚未就绪。');
     }
     await this.audioContext.resume();
     if (this.disposed) return;
 
     this._stopSources();
-    this.pausedTimeUs = this.complete
-      ? Math.min(Math.max(timestampUs, 0), this.durationUs)
-      : Math.max(timestampUs, 0);
-    this.mediaStartUs = this.pausedTimeUs;
     this.contextStartTime = this.audioContext.currentTime;
-    this.scheduledUntilUs = this.mediaStartUs;
+    this.scheduledUntilUs = 0;
     this.playing = true;
     this.schedule();
   }
@@ -110,9 +89,7 @@ export class WebAudioClock {
   schedule() {
     if (!this.playing || !this.audioContext || !this.blocks.length) return;
     const currentUs = this._currentAbsoluteTimeUs();
-    const targetUs = this.complete
-      ? Math.min(currentUs + 1_000_000, this.durationUs)
-      : currentUs + 1_000_000;
+    const targetUs = Math.min(currentUs + 1_000_000, this.durationUs);
     if (this.scheduledUntilUs < currentUs) this.scheduledUntilUs = currentUs;
 
     while (this.scheduledUntilUs < targetUs) {
@@ -133,7 +110,7 @@ export class WebAudioClock {
         this.sources.delete(source);
       };
       source.start(
-        this.contextStartTime + (this.scheduledUntilUs - this.mediaStartUs) / 1_000_000,
+        this.contextStartTime + this.scheduledUntilUs / 1_000_000,
         offsetUs / 1_000_000,
         playableUs / 1_000_000
       );
@@ -142,21 +119,23 @@ export class WebAudioClock {
     }
   }
 
-  pause() {
-    this.pausedTimeUs = this.currentTimeUs;
+  /** 只用于自然结束、错误和 dispose，不保留恢复播放位置。 */
+  stop() {
     this.playing = false;
     this._stopSources();
-    return this.pausedTimeUs;
   }
 
   dispose() {
     if (this.disposed) return;
     this.disposed = true;
-    this.pause();
+    this.stop();
     this._closeDecoder();
     this.blocks = [];
     if (this.audioContext && this.audioContext.state !== 'closed') void this.audioContext.close();
     this.audioContext = null;
+    // stream 可能持有 CodecPrivate 的 Uint8Array 视图，必须随媒体一起断开引用。
+    this.stream = null;
+    this.onError = () => {};
   }
 
   _acceptAudioData(audioData) {
@@ -180,8 +159,6 @@ export class WebAudioClock {
         planes,
         audioBuffer: null,
       });
-      this.blocks.sort((left, right) => left.timestamp - right.timestamp);
-      this.onBufferChange();
     } catch (error) {
       this.onError(error);
     } finally {
@@ -204,9 +181,7 @@ export class WebAudioClock {
   }
 
   _currentAbsoluteTimeUs() {
-    return this.mediaStartUs + Math.round(
-      (this.audioContext.currentTime - this.contextStartTime) * 1_000_000
-    );
+    return Math.round((this.audioContext.currentTime - this.contextStartTime) * 1_000_000);
   }
 
   _stopSources() {
