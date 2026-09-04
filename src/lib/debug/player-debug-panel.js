@@ -38,9 +38,24 @@ export class PlayerDebugPanel {
   _renderVideoInfo() {
     if (!this.videoInfo) return;
     const { width, height, fps, frames, duration } = this.videoInfo;
+    const source = this.videoInfo.source && typeof this.videoInfo.source === 'object'
+      ? this.videoInfo.source
+      : {};
+    const fileName = typeof source.fileName === 'string' ? source.fileName : '';
+    const fileSize = Number.isSafeInteger(source.fileSize) ? source.fileSize : 0;
+    const sourceLabel = fileName
+      ? `${fileName} · ${PlayerDebugPanel._formatBytes(fileSize)} · `
+      : '';
     this.debugInfo.classList.remove('error');
     this.debugInfo.textContent =
-      `${width} × ${height} · ${fps.toFixed(2)} FPS`
+      `${sourceLabel}${width} × ${height} · ${fps.toFixed(2)} FPS`
       + ` · ${frames} 帧 · ${duration.toFixed(2)} 秒 · ${this.rendererName}`;
+  }
+
+  static _formatBytes(bytes) {
+    if (!bytes) return '0 B';
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(2)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
   }
 }

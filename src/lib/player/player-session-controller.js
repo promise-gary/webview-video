@@ -37,7 +37,7 @@ export class PlayerSessionController {
    * 宿主应用先声明准确长度，页面只分配一次最终 ArrayBuffer。
    * begin 阶段不会创建 Decoder、AudioContext 或 GPU Renderer。
    */
-  beginMedia({ sessionId, totalBytes, options = {} } = {}) {
+  beginMedia({ sessionId, totalBytes, source = {}, options = {} } = {}) {
     this._assertAvailable();
     PlayerSessionController._validateSessionId(sessionId);
     if (!Number.isSafeInteger(totalBytes) || totalBytes <= 0) {
@@ -45,6 +45,16 @@ export class PlayerSessionController {
     }
     if (totalBytes > MAX_MEDIA_BYTES) {
       throw new Error(`媒体数据不能超过 ${MAX_MEDIA_BYTES} 字节。`);
+    }
+
+    const sourceInfo = source && typeof source === 'object' ? source : {};
+    const sourceFileName =
+      typeof sourceInfo.fileName === 'string' ? sourceInfo.fileName : '';
+    const sourceFileSize = Number.isSafeInteger(sourceInfo.fileSize)
+      ? sourceInfo.fileSize
+      : totalBytes;
+    if (sourceFileSize !== totalBytes) {
+      throw new Error('原始文件大小与 totalBytes 不一致。');
     }
 
     const mediaOptions = options && typeof options === 'object' ? options : {};
@@ -57,6 +67,10 @@ export class PlayerSessionController {
       receivedBytes: 0,
       nextSequence: 0,
       bytes: new Uint8Array(totalBytes),
+      source: {
+        fileName: sourceFileName,
+        fileSize: sourceFileSize,
+      },
       options: {
         audioEnabled: mediaOptions.audioEnabled !== false,
         webGpuEnabled: mediaOptions.webGpuEnabled !== false,
@@ -102,13 +116,16 @@ export class PlayerSessionController {
 
     const generation = this.generation;
     const mediaBuffer = transfer.bytes.buffer;
+    const sourceInfo = transfer.source;
     const playerOptions = transfer.options;
     this.transfer = null;
     const player = new TransparentWebmPlayer({
       canvas: this.canvas,
       ...playerOptions,
       onVideoInfoChange: (info) => {
-        if (this._isCurrent(sessionId, generation, player)) this.onVideoInfoChange(info);
+        if (this._isCurrent(sessionId, generation, player)) {
+          this.onVideoInfoChange({ ...info, source: sourceInfo });
+        }
       },
       onTechnicalPath: (type, message) => {
         if (this._isCurrent(sessionId, generation, player)) {
@@ -128,12 +145,13 @@ export class PlayerSessionController {
     // WebGPU → WebGL 回退可能替换原 Canvas，控制器必须接管最终节点。
     this.canvas = player.canvas;
     this.onRendererChange(info.renderer);
-    this.bridge.emit('loaded', sessionId, info);
+    const loadedInfo = { ...info, source: sourceInfo };
+    this.bridge.emit('loaded', sessionId, loadedInfo);
     await player.start();
     if (!this._isCurrent(sessionId, generation, player)) {
       throw new Error('媒体启动期间 session 已被替换。');
     }
-    return info;
+    return loadedInfo;
   }
 
   clear({ sessionId } = {}) {

@@ -19,7 +19,8 @@ const playerDebugPanel = PlayerDebugPanel.create({
   parent: debugLayer,
 });
 const logPanel = LogPanel.instance.initialize({
-  enabled: debugEnabled,
+  // 保留技术链路回调，但不再在 debug 模式下挂载可视化日志面板。
+  enabled: false,
   parent: debugLayer,
 });
 //#endregion

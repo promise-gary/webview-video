@@ -39,6 +39,10 @@ VideoFrame 和约 1 秒的 Web Audio 调度窗口；它们是解码渲染所需�
 window.webviewVideo.beginMedia({
   sessionId: 'video-1',
   totalBytes: 10485760,
+  source: {
+    fileName: '001-high.webm',
+    fileSize: 10485760,
+  },
   options: {
     audioEnabled: true,
     webGpuEnabled: true,
@@ -92,6 +96,10 @@ window.webviewVideo.clear({ sessionId: 'video-1' });
   "event": "loaded",
   "sessionId": "video-1",
   "data": {
+    "source": {
+      "fileName": "001-high.webm",
+      "fileSize": 10485760
+    },
     "width": 1080,
     "height": 1920,
     "duration": 22,
@@ -142,8 +150,13 @@ window.webviewVideo.clear({ sessionId: 'video-1' });
 
 ## 静态部署
 
-项目没有运行时第三方依赖和构建步骤，可以直接把仓库中的静态文件部署到 HTTPS
-站点。入口为 `index.html`，可使用 `?debug=true` 显示媒体、Renderer 和技术链路信息。
+项目运行时不需要第三方依赖，但使用 Vite 生成生产静态产物。执行 `npm ci` 和
+`npm run build` 后，`dist` 目录包含一个 `index.html`、一个压缩后的
+`assets/player.js` 和一个压缩后的 `assets/player.css`，可部署到 HTTPS 站点。
+入口为 `index.html`，可使用 `?debug=true` 显示媒体、Renderer 和技术链路信息。
+
+Dockerfile 使用多阶段构建：构建阶段安装 Vite 并生成 `dist`，运行阶段只包含 Nginx
+和 `dist`，不会把源码或 Node.js 带入生产镜像。
 
 浏览器仍会通过 HTTPS 加载站点自身的 HTML、CSS 和 JavaScript 模块；“不主动请求数据”
 特指播放器不会通过 Fetch、XHR 或媒体 URL 获取视频内容。
