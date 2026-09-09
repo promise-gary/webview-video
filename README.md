@@ -10,9 +10,9 @@
         ↓
 WebM Demux
         ↓
-VP9 Color + VP9 Alpha
+单路 VP9（左半 RGB + 右半 Alpha）
         ↓
-双 VideoDecoder → WebGPU / WebGL 合成
+单 VideoDecoder → WebGPU / WebGL 合成
         ↓
 等待最后一帧绘制完成
         ↓
@@ -50,7 +50,7 @@ window.webviewVideo.clear();
 视频的 `fileName` 和错误详情：
 
 ```json
-{"event":"version","fileName":"","data":{"version":"1.0.0"}}
+{"event":"version","fileName":"","data":{"version":"1.0.1"}}
 ```
 
 ```json

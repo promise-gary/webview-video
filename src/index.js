@@ -45,7 +45,7 @@ window.webviewVideo = Object.freeze({
   playNext: () => controller.playNext(),
   clear: () => controller.clear(),
 });
-playerBridge.emit('version', '', { version: '1.0.0' });
+playerBridge.emit('version', '', { version: '1.0.1' });
 
 window.addEventListener('beforeunload', () => controller.dispose(), { once: true });
 void controller.start();

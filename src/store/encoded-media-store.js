@@ -16,6 +16,8 @@ export class EncodedMediaStore {
     this.metadata = {
       width: media.width,
       height: media.height,
+      codedWidth: media.codedWidth,
+      codedHeight: media.codedHeight,
       codec: media.codec,
       audio: media.audio,
     };

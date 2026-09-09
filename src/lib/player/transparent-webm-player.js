@@ -4,7 +4,7 @@ import { RendererFactory } from '../renderers/renderer-factory.js';
 import { EncodedMediaStore } from '../../store/encoded-media-store.js';
 
 // 这是解码/渲染执行窗口，不是网络缓冲。它只限制同时存活的 VideoFrame 数量。
-const MAX_DECODED_PAIRS = 4;
+const MAX_DECODED_FRAMES = 4;
 const AUDIO_DURATION_TOLERANCE_US = 50_000;
 const NOOP = () => {};
 
@@ -28,15 +28,13 @@ export class TransparentWebmPlayer {
 
     this.store = new EncodedMediaStore();
     this.renderer = null;
-    this.colorDecoder = null;
-    this.alphaDecoder = null;
+    this.decoder = null;
     this.audioClock = null;
-    this.nextPairIndex = 0;
+    this.nextFrameIndex = 0;
 
-    this.partialPairs = new Map();
-    this.decodedPairs = [];
-    this.pairsInFlight = 0;
-    this.pendingRenderPair = null;
+    this.decodedFrames = [];
+    this.framesInFlight = 0;
+    this.pendingRenderFrame = null;
     this.renderPromise = null;
     this.decoderDrainPromise = null;
     this.decodersFlushed = false;
@@ -85,7 +83,7 @@ export class TransparentWebmPlayer {
         this.firstFrameResolve = resolve;
         this.firstFrameReject = reject;
       });
-      this._submitPair(this.store.frames[0]);
+      this._submitFrame(this.store.frames[0]);
       await firstFrameReady;
       this._assertLoadingActive();
       return this._createLoadInfo();
@@ -141,9 +139,9 @@ export class TransparentWebmPlayer {
     this.playbackResolve = null;
     this.playbackReject = null;
     const audioDisposePromise = this.audioClock?.dispose() ?? Promise.resolve();
-    this._closePendingRenderPair();
+    this._closePendingRenderFrame();
     this._closeBufferedFrames();
-    this._closeDecoders();
+    this._closeDecoder();
     this.onVideoInfoChange = NOOP;
     this.disposePromise = this._completeDispose(audioDisposePromise);
     return this.disposePromise;
@@ -201,11 +199,11 @@ export class TransparentWebmPlayer {
     this.canvas = this.renderer.canvas;
     const decoderConfig = await this._getDecoderConfig(
       metadata.codec,
-      metadata.width,
-      metadata.height
+      metadata.codedWidth,
+      metadata.codedHeight
     );
     this._assertLoadingActive();
-    this._createDecoders(decoderConfig);
+    this._createDecoder(decoderConfig);
 
     if (!this.audioEnabled) return;
     if (!metadata.audio) throw new Error('启用音频时，WebM 必须包含 Opus 音轨。');
@@ -266,74 +264,56 @@ export class TransparentWebmPlayer {
     return support.config;
   }
 
-  _createDecoders(decoderConfig) {
-    this.colorDecoder = new VideoDecoder({
-      output: (frame) => this._acceptFrame('color', frame),
+  _createDecoder(decoderConfig) {
+    this.decoder = new VideoDecoder({
+      output: (frame) => this._acceptFrame(frame),
       error: (error) => this._fail(error),
     });
-    this.alphaDecoder = new VideoDecoder({
-      output: (frame) => this._acceptFrame('alpha', frame),
-      error: (error) => this._fail(error),
-    });
-    this.colorDecoder.configure(decoderConfig);
-    this.alphaDecoder.configure(decoderConfig);
+    this.decoder.configure(decoderConfig);
   }
 
-  _submitPair(pair) {
-    this.colorDecoder.decode(this._createChunk(pair.color, pair));
-    this.alphaDecoder.decode(this._createChunk(pair.alpha, pair));
-    this.nextPairIndex += 1;
-    this.pairsInFlight += 1;
-  }
-
-  _createChunk(frame, pair) {
-    return new EncodedVideoChunk({
+  _submitFrame(frame) {
+    this.decoder.decode(new EncodedVideoChunk({
       type: frame.type,
-      timestamp: pair.timestamp,
-      duration: pair.duration,
+      timestamp: frame.timestamp,
+      duration: frame.duration,
       data: frame.data,
-    });
+    }));
+    this.nextFrameIndex += 1;
+    this.framesInFlight += 1;
   }
 
-  _acceptFrame(channel, frame) {
+  _acceptFrame(frame) {
     if (this.failed || this.disposed) {
       frame.close();
       return;
     }
-    const pair = this.partialPairs.get(frame.timestamp) ?? { timestamp: frame.timestamp };
-    pair[channel]?.close();
-    pair[channel] = frame;
-    this.partialPairs.set(frame.timestamp, pair);
-    if (!pair.color || !pair.alpha) return;
-
-    this.partialPairs.delete(frame.timestamp);
-    this.pairsInFlight = Math.max(0, this.pairsInFlight - 1);
-    this.decodedPairs.push(pair);
-    this.decodedPairs.sort((left, right) => left.timestamp - right.timestamp);
-    // 首帧时间戳不一定严格为 0，loaded 仍必须等待这对帧完成实际渲染。
-    if (!this.playing && !this.firstFrameRendered) this._drawThrough(pair.timestamp);
+    this.framesInFlight = Math.max(0, this.framesInFlight - 1);
+    this.decodedFrames.push(frame);
+    this.decodedFrames.sort((left, right) => left.timestamp - right.timestamp);
+    // 首帧时间戳不一定严格为 0，load 仍必须等待它完成实际渲染。
+    if (!this.playing && !this.firstFrameRendered) this._drawThrough(frame.timestamp);
   }
 
   _decodeAhead() {
     if (
       !this.playing
       || this.failed
-      || this.colorDecoder?.state !== 'configured'
-      || this.alphaDecoder?.state !== 'configured'
+      || this.decoder?.state !== 'configured'
     ) return;
 
     try {
       while (
-        this.nextPairIndex < this.store.frames.length
-        && this.decodedPairs.length
-          + this.pairsInFlight
+        this.nextFrameIndex < this.store.frames.length
+        && this.decodedFrames.length
+          + this.framesInFlight
           + (this.renderPromise ? 1 : 0)
-          + (this.pendingRenderPair ? 1 : 0) < MAX_DECODED_PAIRS
+          + (this.pendingRenderFrame ? 1 : 0) < MAX_DECODED_FRAMES
       ) {
-        this._submitPair(this.store.frames[this.nextPairIndex]);
+        this._submitFrame(this.store.frames[this.nextFrameIndex]);
       }
-      if (this.nextPairIndex === this.store.frames.length) {
-        this._drainDecoders();
+      if (this.nextFrameIndex === this.store.frames.length) {
+        this._drainDecoder();
       }
     } catch (error) {
       this._fail(error);
@@ -350,8 +330,7 @@ export class TransparentWebmPlayer {
     if (
       this.currentTimeUs >= this._getDurationUs()
       && this.decodersFlushed
-      && this.pairsInFlight === 0
-      && this.partialPairs.size === 0
+      && this.framesInFlight === 0
     ) {
       this._finishPlayback();
       return;
@@ -367,42 +346,40 @@ export class TransparentWebmPlayer {
   }
 
   _drawThrough(timestampUs) {
-    let selectedPair = null;
-    while (this.decodedPairs.length && this.decodedPairs[0].timestamp <= timestampUs) {
-      if (selectedPair) TransparentWebmPlayer._closePair(selectedPair);
-      selectedPair = this.decodedPairs.shift();
+    let selectedFrame = null;
+    while (this.decodedFrames.length && this.decodedFrames[0].timestamp <= timestampUs) {
+      selectedFrame?.close();
+      selectedFrame = this.decodedFrames.shift();
     }
-    if (selectedPair) this._queueRenderPair(selectedPair);
+    if (selectedFrame) this._queueRenderFrame(selectedFrame);
   }
 
-  _queueRenderPair(pair) {
+  _queueRenderFrame(frame) {
     if (this.failed || this.disposed) {
-      TransparentWebmPlayer._closePair(pair);
+      frame.close();
       return;
     }
     if (this.renderPromise) {
-      if (this.pendingRenderPair) {
-        TransparentWebmPlayer._closePair(this.pendingRenderPair);
-      }
-      this.pendingRenderPair = pair;
+      this.pendingRenderFrame?.close();
+      this.pendingRenderFrame = frame;
       return;
     }
-    this._startRender(pair);
+    this._startRender(frame);
   }
 
-  _startRender(pair) {
-    const renderPromise = this._renderPair(pair);
+  _startRender(frame) {
+    const renderPromise = this._renderFrame(frame);
     this.renderPromise = renderPromise;
     void renderPromise.finally(() => {
       if (this.renderPromise !== renderPromise) return;
       this.renderPromise = null;
-      const pendingPair = this.pendingRenderPair;
-      this.pendingRenderPair = null;
-      if (pendingPair) {
+      const pendingFrame = this.pendingRenderFrame;
+      this.pendingRenderFrame = null;
+      if (pendingFrame) {
         if (this.failed || this.disposed) {
-          TransparentWebmPlayer._closePair(pendingPair);
+          pendingFrame.close();
         } else {
-          this._startRender(pendingPair);
+          this._startRender(pendingFrame);
         }
       } else {
         this._decodeAhead();
@@ -410,9 +387,9 @@ export class TransparentWebmPlayer {
     });
   }
 
-  async _renderPair(pair) {
+  async _renderFrame(frame) {
     try {
-      await this.renderer.render(pair);
+      await this.renderer.render(frame);
       if (!this.firstFrameRendered && !this.failed && !this.disposed) {
         this.firstFrameRendered = true;
         this.firstFrameResolve?.();
@@ -422,7 +399,7 @@ export class TransparentWebmPlayer {
     } catch (error) {
       this._fail(error);
     } finally {
-      TransparentWebmPlayer._closePair(pair);
+      frame.close();
     }
   }
 
@@ -447,19 +424,18 @@ export class TransparentWebmPlayer {
     this.playbackReject = null;
   }
 
-  _drainDecoders() {
+  _drainDecoder() {
     if (this.decoderDrainPromise || this.decodersFlushed) return;
-    const decoders = [this.colorDecoder, this.alphaDecoder].filter(
-      (decoder) => decoder?.state === 'configured'
-    );
-    const drainPromise = Promise.all(decoders.map((decoder) => decoder.flush()))
+    const decoder = this.decoder;
+    if (decoder?.state !== 'configured') return;
+    const drainPromise = decoder.flush()
       .then(() => {
         if (this.disposed || this.failed) return;
-        if (this.pairsInFlight || this.partialPairs.size) {
-          throw new Error('Color/Alpha 解码帧未完整配对。');
+        if (this.framesInFlight) {
+          throw new Error('仍有视频帧未完成解码。');
         }
         this.decodersFlushed = true;
-        this._closeDecoders();
+        this._closeDecoder();
       });
     this.decoderDrainPromise = drainPromise;
     void drainPromise.catch((error) => this._fail(error));
@@ -482,9 +458,9 @@ export class TransparentWebmPlayer {
     cancelAnimationFrame(this.animationId);
     this.animationId = 0;
     this.audioClock?.stop();
-    this._closePendingRenderPair();
+    this._closePendingRenderFrame();
     this._closeBufferedFrames();
-    this._closeDecoders();
+    this._closeDecoder();
     this.firstFrameReject?.(error);
     this.firstFrameResolve = null;
     this.firstFrameReject = null;
@@ -493,29 +469,20 @@ export class TransparentWebmPlayer {
     this.playbackReject = null;
   }
 
-  _closePendingRenderPair() {
-    if (!this.pendingRenderPair) return;
-    TransparentWebmPlayer._closePair(this.pendingRenderPair);
-    this.pendingRenderPair = null;
+  _closePendingRenderFrame() {
+    this.pendingRenderFrame?.close();
+    this.pendingRenderFrame = null;
   }
 
   _closeBufferedFrames() {
-    for (const pair of this.partialPairs.values()) {
-      pair.color?.close();
-      pair.alpha?.close();
-    }
-    this.partialPairs.clear();
-    for (const pair of this.decodedPairs) TransparentWebmPlayer._closePair(pair);
-    this.decodedPairs = [];
+    for (const frame of this.decodedFrames) frame.close();
+    this.decodedFrames = [];
   }
 
-  _closeDecoders() {
-    const decoders = [this.colorDecoder, this.alphaDecoder];
-    this.colorDecoder = null;
-    this.alphaDecoder = null;
-    for (const decoder of decoders) {
-      if (decoder && decoder.state !== 'closed') decoder.close();
-    }
+  _closeDecoder() {
+    const decoder = this.decoder;
+    this.decoder = null;
+    if (decoder && decoder.state !== 'closed') decoder.close();
   }
 
   static _toArrayBuffer(mediaData) {
@@ -523,10 +490,5 @@ export class TransparentWebmPlayer {
     if (!ArrayBuffer.isView(mediaData)) throw new Error('媒体数据必须是完整的二进制数据。');
     const bytes = new Uint8Array(mediaData.buffer, mediaData.byteOffset, mediaData.byteLength);
     return bytes.slice().buffer;
-  }
-
-  static _closePair(pair) {
-    pair.color.close();
-    pair.alpha.close();
   }
 }

@@ -1,7 +1,7 @@
 /**
  * WebGPU 渲染后端。
  *
- * 它不负责解码，也不拥有播放队列。输入是一对已经按 timestamp 配对的
+ * 它不负责解码，也不拥有播放队列。输入是一张左侧 RGB、右侧 Alpha 的
  * VideoFrame，输出是带透明通道的 WebGPU Canvas。
  *
  * 与 WebGL 版的核心区别：
@@ -40,10 +40,9 @@ export class WebGpuRenderer {
 
       const module = device.createShaderModule({
         code: `
-          // binding 0 是公共采样器，binding 1/2 分别是颜色和 Alpha 帧。
+          // binding 0 是采样器，binding 1 是左右拼接的单张视频帧。
           @group(0) @binding(0) var frameSampler: sampler;
-          @group(0) @binding(1) var colorFrame: texture_external;
-          @group(0) @binding(2) var alphaFrame: texture_external;
+          @group(0) @binding(1) var packedFrame: texture_external;
 
           struct VertexOutput {
             @builtin(position) position: vec4f,
@@ -72,17 +71,19 @@ export class WebGpuRenderer {
           @fragment
           fn fragmentMain(input: VertexOutput) -> @location(0) vec4f {
             // 外部纹理可能来自 YUV VideoFrame，浏览器负责采样时的颜色转换。
+            let colorCoord = vec2f(input.texCoord.x * 0.5, input.texCoord.y);
+            let alphaCoord = vec2f(0.5 + input.texCoord.x * 0.5, input.texCoord.y);
             let color = textureSampleBaseClampToEdge(
-              colorFrame,
+              packedFrame,
               frameSampler,
-              input.texCoord
+              colorCoord
             );
 
             // Alpha 视频是灰度画面，取转换后颜色的 red 通道作为透明度。
             let alpha = textureSampleBaseClampToEdge(
-              alphaFrame,
+              packedFrame,
               frameSampler,
-              input.texCoord
+              alphaCoord
             ).r;
 
             // Canvas 使用 premultiplied alpha，因此 RGB 必须预先乘以 Alpha。
@@ -128,12 +129,12 @@ export class WebGpuRenderer {
   }
 
   /**
-   * 渲染一对 VideoFrame。
+   * 渲染一张左右拼接的 VideoFrame。
    *
    * Promise 只有在 GPU 已完成本次之前提交的工作后才结束。Player 会等待
    * Promise settle 后关闭 VideoFrame，保证外部纹理使用期间源帧仍然有效。
    */
-  async render(pair) {
+  async render(frame) {
     if (this.destroyed) throw new Error('WebGPU Renderer 已释放。');
     const device = this.device;
 
@@ -147,11 +148,7 @@ export class WebGpuRenderer {
         { binding: 0, resource: this.sampler },
         {
           binding: 1,
-          resource: device.importExternalTexture({ source: pair.color }),
-        },
-        {
-          binding: 2,
-          resource: device.importExternalTexture({ source: pair.alpha }),
+          resource: device.importExternalTexture({ source: frame }),
         },
       ],
     });
@@ -174,7 +171,7 @@ export class WebGpuRenderer {
     pass.end();
     device.queue.submit([encoder.finish()]);
 
-    // Player 在该 Promise 完成后 close Color/Alpha VideoFrame。
+    // Player 在该 Promise 完成后关闭 VideoFrame。
     await device.queue.onSubmittedWorkDone();
   }
 

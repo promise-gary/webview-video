@@ -1,7 +1,7 @@
 /**
  * 当前 Demo 所需的最小 WebM / Matroska Element ID。
  *
- * 这里只实现“单 VP9 Alpha 视频轨 + 单 Opus 音频轨”的读取能力，不试图成为
+ * 这里只实现“单路左右拼接 VP9 视频轨 + 单 Opus 音频轨”的读取能力，不试图成为
  * 通用 Matroska 库。遇到加密、Lacing、多视频轨等结构时会明确报错。
  */
 const ID = Object.freeze({
@@ -18,11 +18,10 @@ const ID = Object.freeze({
   CODEC_ID: 0x86,
   CODEC_PRIVATE: 0x63a2,
 
-  // VP9 视频轨的尺寸和透明视频标记。
+  // VP9 视频轨的编码尺寸。
   VIDEO: 0xe0,
   PIXEL_WIDTH: 0xb0,
   PIXEL_HEIGHT: 0xba,
-  ALPHA_MODE: 0x53c0,
 
   // Opus 音频轨的采样参数。
   AUDIO: 0xe1,
@@ -36,12 +35,6 @@ const ID = Object.freeze({
   BLOCK: 0xa1,
   SIMPLE_BLOCK: 0xa3,
   BLOCK_DURATION: 0x9b,
-
-  // WebM Alpha 通过 BlockAdditional 给同一颜色帧附加一份 VP9 Alpha 帧。
-  BLOCK_ADDITIONS: 0x75a1,
-  BLOCK_MORE: 0xa6,
-  BLOCK_ADD_ID: 0xee,
-  BLOCK_ADDITIONAL: 0xa5,
 });
 
 // Matroska TrackType 的标准编号：1 表示视频，2 表示音频。
@@ -59,14 +52,8 @@ const FALLBACK_AUDIO_DURATION_US = 20_000;
  * 完整 WebM 文件的解析工具。宿主应用传输全部字节并确认结束后，播放器才调用
  * parse()；播放阶段不会再等待或追加媒体数据。
  *
- * WebM Alpha 的物理结构是：
- *
- * BlockGroup
- *   ├─ Block                    → 普通 VP9 颜色帧
- *   └─ BlockAdditions
- *       └─ BlockAdditional      → 单独编码的 VP9 Alpha 帧
- *
- * 因此，“直接使用 WebM”仍然需要 Demux，但不需要事先生成两份 IVF。
+ * 每个 VP9 帧的左半边保存 RGB，右半边保存灰度 Alpha。Demux 后每个时间戳
+ * 只产生一个压缩块，播放器也只需一个 VideoDecoder。
  */
 export class WebmDemuxer {
   /**
@@ -76,8 +63,8 @@ export class WebmDemuxer {
    *   frames: Array<{
    *     timestamp: number,
    *     duration: number,
-   *     color: { data: Uint8Array, type: 'key' | 'delta' },
-   *     alpha: { data: Uint8Array, type: 'key' | 'delta' }
+   *     data: Uint8Array,
+   *     type: 'key' | 'delta'
    *   }>,
    *   width: number,
    *   height: number,
@@ -134,10 +121,10 @@ export class WebmDemuxer {
 
     // Cluster 一般按时间排列，但显式排序可以避免依赖封装器的写入顺序。
     frames.sort((left, right) => left.timestamp - right.timestamp);
-    if (!frames.length) throw new Error('WebM 中没有可解码的 VP9 Alpha 帧。');
+    if (!frames.length) throw new Error('WebM 中没有可解码的 VP9 帧。');
     const firstFrame = frames[0];
-    if (firstFrame.color.type !== 'key' || firstFrame.alpha.type !== 'key') {
-      throw new Error('WebM 的第一对 Color/Alpha 帧必须都是关键帧。');
+    if (firstFrame.type !== 'key') {
+      throw new Error('WebM 的第一帧必须是关键帧。');
     }
 
     // WebCodecs chunk 最好带 duration；容器未写时根据下一个 timestamp 推导。
@@ -145,10 +132,12 @@ export class WebmDemuxer {
     if (audioChunks) this._fillChunkDurations(audioChunks, FALLBACK_AUDIO_DURATION_US);
     return {
       frames,
-      width: videoTrack.width,
+      width: videoTrack.width / 2,
       height: videoTrack.height,
+      codedWidth: videoTrack.width,
+      codedHeight: videoTrack.height,
       duration: frames.at(-1).timestamp + frames.at(-1).duration,
-      codec: 'vp09.00.40.08',
+      codec: 'vp09.00.10.08',
       audio: audioTrack
         ? {
           chunks: audioChunks,
@@ -183,7 +172,7 @@ export class WebmDemuxer {
     return DEFAULT_TIMECODE_SCALE_NS;
   }
 
-  // 读取本 Demo 支持的唯一 VP9 Alpha 视频轨，以及可选的唯一 Opus 音频轨。
+  // 读取本播放器支持的唯一 VP9 视频轨，以及可选的唯一 Opus 音频轨。
   static _readTracks(bytes, tracks, audioEnabled) {
     const videoTracks = [];
     const audioTracks = audioEnabled ? [] : null;
@@ -241,9 +230,9 @@ export class WebmDemuxer {
       || !track.number
       || !track.width
       || !track.height
-      || track.alphaMode !== 1
+      || track.width % 2 !== 0
     ) {
-      throw new Error('视频轨必须是带 AlphaMode 的有效 VP9 轨道。');
+      throw new Error('视频轨必须是宽度可二等分的有效 VP9 轨道。');
     }
 
     if (audioTracks && audioTracks.length > 1) {
@@ -268,17 +257,14 @@ export class WebmDemuxer {
   static _readVideoSettings(bytes, video) {
     let width = 0;
     let height = 0;
-    let alphaMode = 0;
     for (const element of this._children(bytes, video)) {
       if (element.id === ID.PIXEL_WIDTH) {
         width = this._readUnsigned(bytes, element);
       } else if (element.id === ID.PIXEL_HEIGHT) {
         height = this._readUnsigned(bytes, element);
-      } else if (element.id === ID.ALPHA_MODE) {
-        alphaMode = this._readUnsigned(bytes, element);
       }
     }
-    return { width, height, alphaMode };
+    return { width, height };
   }
 
   // Audio Element 里的采样率是 EBML Float，声道数是 EBML Unsigned Integer。
@@ -322,7 +308,6 @@ export class WebmDemuxer {
         const blockElement = this._findBlock(bytes, element);
         const track = this._readVint(bytes, blockElement.dataOffset, false);
         if (track.value !== videoTrackNumber && track.value !== audioTrackNumber) continue;
-        // 带 Alpha 的视频必须使用 BlockGroup，才能同时携带 BlockAdditional。
         const group = this._readBlockGroup(bytes, element);
         const timestamp = this._toMicroseconds(
           clusterTimecode + group.relativeTimecode,
@@ -333,20 +318,11 @@ export class WebmDemuxer {
           : 0;
 
         if (group.trackNumber === videoTrackNumber) {
-          if (!group.alphaData) {
-            throw new Error(`时间戳 ${group.relativeTimecode} 的视频帧缺少 Alpha。`);
-          }
           frames.push({
             timestamp,
             duration,
-            color: {
-              data: group.data,
-              type: this._frameType(group.data),
-            },
-            alpha: {
-              data: group.alphaData,
-              type: this._frameType(group.alphaData),
-            },
+            data: group.data,
+            type: this._frameType(group.data),
           });
         } else if (audioChunks && group.trackNumber === audioTrackNumber) {
           audioChunks.push(this._createAudioChunk(group, timestamp, duration));
@@ -354,16 +330,20 @@ export class WebmDemuxer {
       } else if (element.id === ID.SIMPLE_BLOCK) {
         const track = this._readVint(bytes, element.dataOffset, false);
         if (track.value !== videoTrackNumber && track.value !== audioTrackNumber) continue;
-        // ffmpeg 生成的 Opus packet 使用更轻量的 SimpleBlock，不含 Alpha 附加数据。
         const block = this._readBlock(bytes, element);
+        const timestamp = this._toMicroseconds(
+          clusterTimecode + block.relativeTimecode,
+          timecodeScaleNs
+        );
         if (audioChunks && block.trackNumber === audioTrackNumber) {
-          const timestamp = this._toMicroseconds(
-            clusterTimecode + block.relativeTimecode,
-            timecodeScaleNs
-          );
           audioChunks.push(this._createAudioChunk(block, timestamp, 0));
         } else if (block.trackNumber === videoTrackNumber) {
-          throw new Error('带 Alpha 的视频帧必须使用 BlockGroup。');
+          frames.push({
+            timestamp,
+            duration: 0,
+            data: block.data,
+            type: this._frameType(block.data),
+          });
         }
       }
     }
@@ -377,40 +357,19 @@ export class WebmDemuxer {
     throw new Error('BlockGroup 缺少 Block。');
   }
 
-  // 将 BlockGroup 还原成“主压缩块 + 可选 Alpha + 可选 duration”。
+  // 将 BlockGroup 还原成压缩块和可选 duration。
   static _readBlockGroup(bytes, blockGroup) {
     let block = null;
-    let alphaData = null;
     let durationTicks = 0;
     for (const element of this._children(bytes, blockGroup)) {
       if (element.id === ID.BLOCK) {
         block = this._readBlock(bytes, element);
       } else if (element.id === ID.BLOCK_DURATION) {
         durationTicks = this._readUnsigned(bytes, element);
-      } else if (element.id === ID.BLOCK_ADDITIONS) {
-        alphaData = this._readAlphaAddition(bytes, element);
       }
     }
     if (!block) throw new Error('BlockGroup 缺少 Block。');
-    return { ...block, alphaData, durationTicks };
-  }
-
-  // BlockAddID=1 是 WebM Alpha 的传统映射；省略 BlockAddID 时默认同样为 1。
-  static _readAlphaAddition(bytes, additions) {
-    for (const more of this._children(bytes, additions)) {
-      if (more.id !== ID.BLOCK_MORE) continue;
-      let blockAddId = 1;
-      let data = null;
-      for (const element of this._children(bytes, more)) {
-        if (element.id === ID.BLOCK_ADD_ID) {
-          blockAddId = this._readUnsigned(bytes, element);
-        } else if (element.id === ID.BLOCK_ADDITIONAL) {
-          data = bytes.subarray(element.dataOffset, element.end);
-        }
-      }
-      if (blockAddId === 1 && data) return data;
-    }
-    return null;
+    return { ...block, durationTicks };
   }
 
   /**

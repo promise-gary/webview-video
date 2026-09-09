@@ -1,9 +1,8 @@
 /**
  * WebGL 兼容渲染后端。
  *
- * 输入和 WebGPU Renderer 相同：一对 Color/Alpha VideoFrame。
- * 区别是这里通过 texSubImage2D() 将 VideoFrame 内容更新到两张预分配的
- * WebGL Texture，再用 GLSL Fragment Shader 合成最终 RGBA。
+ * 输入和 WebGPU Renderer 相同：一张左侧 RGB、右侧 Alpha 的 VideoFrame。
+ * 这里通过 texSubImage2D() 更新一张预分配纹理，再用 Fragment Shader 合成。
  */
 export class WebGlRenderer {
   /**
@@ -27,25 +26,23 @@ export class WebGlRenderer {
     this.name = 'WebGL';
     this.program = this._createProgram();
     this.buffer = this._createBuffer();
-    this.colorTexture = this._createTexture(gl.TEXTURE0, canvas.width, canvas.height);
-    this.alphaTexture = this._createTexture(gl.TEXTURE1, canvas.width, canvas.height);
+    this.packedTexture = this._createTexture(gl.TEXTURE0, canvas.width * 2, canvas.height);
     this.destroyed = false;
 
     gl.useProgram(this.program);
-    gl.uniform1i(gl.getUniformLocation(this.program, 'u_color'), 0);
-    gl.uniform1i(gl.getUniformLocation(this.program, 'u_alpha'), 1);
+    gl.uniform1i(gl.getUniformLocation(this.program, 'u_packed'), 0);
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
     gl.clearColor(0, 0, 0, 0);
   }
 
   /**
-   * 把一对 VideoFrame 上传为两张纹理并绘制。
+   * 把一张 VideoFrame 上传为纹理并绘制。
    *
    * texSubImage2D() 可能触发像素格式转换或纹理复制，但不会每帧重新分配
    * 纹理存储，且兼容性通常比
    * WebGPU importExternalTexture() 更广。该方法完成后 Player 即可关闭帧。
    */
-  async render(pair) {
+  async render(frame) {
     if (this.destroyed) throw new Error('WebGL Renderer 已释放。');
     const gl = this.gl;
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
@@ -54,11 +51,7 @@ export class WebGlRenderer {
     gl.clear(gl.COLOR_BUFFER_BIT);
     gl.useProgram(this.program);
 
-    // Texture Unit 0 保存当前颜色 VideoFrame。
-    this._uploadFrame(gl.TEXTURE0, this.colorTexture, pair.color);
-
-    // Texture Unit 1 保存当前灰度 Alpha VideoFrame。
-    this._uploadFrame(gl.TEXTURE1, this.alphaTexture, pair.alpha);
+    this._uploadFrame(gl.TEXTURE0, this.packedTexture, frame);
 
     // 六个顶点组成两个三角形，Fragment Shader 会覆盖完整 Canvas。
     gl.drawArrays(gl.TRIANGLES, 0, 6);
@@ -85,8 +78,7 @@ export class WebGlRenderer {
     this.destroyed = true;
     const gl = this.gl;
     gl.finish();
-    gl.deleteTexture(this.colorTexture);
-    gl.deleteTexture(this.alphaTexture);
+    gl.deleteTexture(this.packedTexture);
     gl.deleteBuffer(this.buffer);
     gl.deleteProgram(this.program);
     gl.getExtension('WEBGL_lose_context')?.loseContext();
@@ -96,7 +88,7 @@ export class WebGlRenderer {
    * 创建合成程序：
    *
    * Vertex Shader 负责位置和纹理坐标；
-   * Fragment Shader 采样颜色 RGB，并取 Alpha 纹理 red 通道作为透明度。
+   * Fragment Shader 分别采样左右半边，并取右半边 red 通道作为透明度。
    */
   _createProgram() {
     const gl = this.gl;
@@ -112,13 +104,14 @@ export class WebGlRenderer {
     `);
     const fragmentShader = this._compile(gl.FRAGMENT_SHADER, `
       precision mediump float;
-      uniform sampler2D u_color;
-      uniform sampler2D u_alpha;
+      uniform sampler2D u_packed;
       varying vec2 v_texCoord;
 
       void main() {
-        vec3 color = texture2D(u_color, v_texCoord).rgb;
-        float alpha = texture2D(u_alpha, v_texCoord).r;
+        vec2 colorCoord = vec2(v_texCoord.x * 0.5, v_texCoord.y);
+        vec2 alphaCoord = vec2(0.5 + v_texCoord.x * 0.5, v_texCoord.y);
+        vec3 color = texture2D(u_packed, colorCoord).rgb;
+        float alpha = texture2D(u_packed, alphaCoord).r;
 
         // Context 配置 premultipliedAlpha=false，因此这里输出 straight alpha。
         gl_FragColor = vec4(color, alpha);
@@ -182,7 +175,7 @@ export class WebGlRenderer {
     return buffer;
   }
 
-  // 两张纹理只分配一次；每帧通过 texSubImage2D() 更新其内容。
+  // 拼接纹理只分配一次；每帧通过 texSubImage2D() 更新其内容。
   _createTexture(unit, width, height) {
     const gl = this.gl;
     const texture = gl.createTexture();
