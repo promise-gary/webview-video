@@ -6,6 +6,7 @@ export class WebAudioClock {
     this.audioContext = null;
     this.decoder = null;
     this.blocks = [];
+    this.nextBlockIndex = 0;
     this.sources = new Set();
     this.inputEnded = false;
     this.durationUs = 0;
@@ -13,10 +14,12 @@ export class WebAudioClock {
     this.scheduledUntilUs = 0;
     this.playing = false;
     this.disposed = false;
+    this.disposePromise = null;
   }
 
   /** 配置 Decoder 和 AudioContext；不会触发声音，真正 resume() 在 start()。 */
   async initialize() {
+    if (this.disposed) throw new Error('音频时钟已释放。');
     if (!('AudioDecoder' in window) || !('EncodedAudioChunk' in window)) {
       throw new Error('当前环境不支持 AudioDecoder。');
     }
@@ -28,6 +31,7 @@ export class WebAudioClock {
       sampleRate: this.stream.sampleRate,
       numberOfChannels: this.stream.numberOfChannels,
     });
+    if (this.disposed) throw new Error('音频初始化已取消。');
     if (!support.supported) throw new Error(`当前环境不支持音频编码 ${this.stream.codec}。`);
 
     this.audioContext = new AudioContextConstructor();
@@ -53,7 +57,13 @@ export class WebAudioClock {
   async end() {
     if (!this.decoder || this.inputEnded) return;
     this.inputEnded = true;
-    await this.decoder.flush();
+    try {
+      await this.decoder.flush();
+    } catch (error) {
+      if (this.disposed) return;
+      throw error;
+    }
+    if (this.disposed) return;
     this._closeDecoder();
     this.blocks.sort((left, right) => left.timestamp - right.timestamp);
     this.durationUs = this.decodedEndUs;
@@ -81,6 +91,7 @@ export class WebAudioClock {
     this._stopSources();
     this.contextStartTime = this.audioContext.currentTime;
     this.scheduledUntilUs = 0;
+    this.nextBlockIndex = 0;
     this.playing = true;
     this.schedule();
   }
@@ -94,19 +105,24 @@ export class WebAudioClock {
 
     while (this.scheduledUntilUs < targetUs) {
       const positionUs = this.scheduledUntilUs;
-      const block = this.blocks.find((candidate) => (
-        candidate.timestamp <= positionUs
-        && positionUs < candidate.timestamp + candidate.duration
-      ));
+      const block = this.blocks[this.nextBlockIndex];
       if (!block) return;
+      if (block.timestamp + block.duration <= positionUs) {
+        this.blocks[this.nextBlockIndex] = null;
+        this.nextBlockIndex += 1;
+        continue;
+      }
+      if (block.timestamp > positionUs) return;
 
       const offsetUs = positionUs - block.timestamp;
       const playableUs = block.duration - offsetUs;
       const source = this.audioContext.createBufferSource();
-      source.buffer = this._getAudioBuffer(block);
+      source.buffer = block.audioBuffer;
       source.connect(this.audioContext.destination);
       source.onended = () => {
         source.disconnect();
+        source.onended = null;
+        source.buffer = null;
         this.sources.delete(source);
       };
       source.start(
@@ -115,6 +131,8 @@ export class WebAudioClock {
         playableUs / 1_000_000
       );
       this.sources.add(source);
+      this.blocks[this.nextBlockIndex] = null;
+      this.nextBlockIndex += 1;
       this.scheduledUntilUs += playableUs;
     }
   }
@@ -126,16 +144,21 @@ export class WebAudioClock {
   }
 
   dispose() {
-    if (this.disposed) return;
+    if (this.disposePromise) return this.disposePromise;
     this.disposed = true;
     this.stop();
     this._closeDecoder();
     this.blocks = [];
-    if (this.audioContext && this.audioContext.state !== 'closed') void this.audioContext.close();
+    this.nextBlockIndex = 0;
+    const audioContext = this.audioContext;
     this.audioContext = null;
     // stream 可能持有 CodecPrivate 的 Uint8Array 视图，必须随媒体一起断开引用。
     this.stream = null;
     this.onError = () => {};
+    this.disposePromise = audioContext && audioContext.state !== 'closed'
+      ? audioContext.close().catch(() => {})
+      : Promise.resolve();
+    return this.disposePromise;
   }
 
   _acceptAudioData(audioData) {
@@ -147,37 +170,27 @@ export class WebAudioClock {
       if (audioData.numberOfChannels !== this.stream.numberOfChannels) {
         throw new Error(`AudioDecoder 输出声道数异常：${audioData.numberOfChannels}。`);
       }
-      const planes = [];
+      const audioBuffer = this.audioContext.createBuffer(
+        audioData.numberOfChannels,
+        audioData.numberOfFrames,
+        audioData.sampleRate
+      );
       for (let channel = 0; channel < audioData.numberOfChannels; channel += 1) {
-        const samples = new Float32Array(audioData.numberOfFrames);
-        audioData.copyTo(samples, { planeIndex: channel, format: 'f32-planar' });
-        planes.push(samples);
+        audioData.copyTo(audioBuffer.getChannelData(channel), {
+          planeIndex: channel,
+          format: 'f32-planar',
+        });
       }
       this.blocks.push({
         timestamp: audioData.timestamp,
         duration: Math.round(audioData.numberOfFrames * 1_000_000 / audioData.sampleRate),
-        planes,
-        audioBuffer: null,
+        audioBuffer,
       });
     } catch (error) {
       this.onError(error);
     } finally {
       audioData.close();
     }
-  }
-
-  _getAudioBuffer(block) {
-    if (block.audioBuffer) return block.audioBuffer;
-    const buffer = this.audioContext.createBuffer(
-      this.stream.numberOfChannels,
-      block.planes[0].length,
-      this.stream.sampleRate
-    );
-    for (let channel = 0; channel < block.planes.length; channel += 1) {
-      buffer.copyToChannel(block.planes[channel], channel);
-    }
-    block.audioBuffer = buffer;
-    return buffer;
   }
 
   _currentAbsoluteTimeUs() {
@@ -193,6 +206,7 @@ export class WebAudioClock {
       } catch {
         // 已自然播放完的 AudioBufferSourceNode 不能再次 stop()。
       }
+      source.buffer = null;
     }
     this.sources.clear();
   }

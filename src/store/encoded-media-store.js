@@ -10,10 +10,9 @@ export class EncodedMediaStore {
     this.frames = [];
     this.audioChunks = [];
     this.videoDurationUs = 0;
-    this.sourceBytes = 0;
   }
 
-  load(media, sourceBytes) {
+  load(media) {
     this.metadata = {
       width: media.width,
       height: media.height,
@@ -23,7 +22,6 @@ export class EncodedMediaStore {
     this.frames = media.frames;
     this.audioChunks = media.audio?.chunks ?? [];
     this.videoDurationUs = media.duration;
-    this.sourceBytes = sourceBytes;
   }
 
   clear() {
@@ -31,6 +29,5 @@ export class EncodedMediaStore {
     this.frames = [];
     this.audioChunks = [];
     this.videoDurationUs = 0;
-    this.sourceBytes = 0;
   }
 }

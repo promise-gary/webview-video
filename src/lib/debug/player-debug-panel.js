@@ -1,4 +1,4 @@
-/** 播放器业务调试面板：只展示完整媒体信息和实际 Renderer。 */
+/** 播放器业务调试面板：展示下载进度、媒体信息和实际 Renderer。 */
 export class PlayerDebugPanel {
   static create({ enabled, parent }) {
     return new PlayerDebugPanel({ enabled, parent });
@@ -10,11 +10,35 @@ export class PlayerDebugPanel {
     this.videoInfo = null;
     this.panel = parent.querySelector('#player-debug-panel');
     this.debugInfo = this.panel.querySelector('#debug-info');
+    this.downloadProgress = this.panel.querySelector('#download-progress');
+    this.downloadDetail = this.panel.querySelector('#download-detail');
 
     if (enabled) {
       parent.hidden = false;
       this.panel.hidden = false;
     }
+  }
+
+  updateDownload({ fileName, loadedBytes, totalBytes, complete }) {
+    if (!this.enabled) return;
+    if (!totalBytes) {
+      this.rendererName = '初始化中';
+      this.videoInfo = null;
+      this.debugInfo.classList.remove('error');
+      this.debugInfo.textContent = `正在下载 ${fileName}…`;
+      this.downloadProgress.value = 0;
+      this.downloadProgress.textContent = '0%';
+      this.downloadDetail.textContent = `${fileName} · 等待下载…`;
+      return;
+    }
+
+    const percent = Math.min(100, loadedBytes / totalBytes * 100);
+    this.downloadProgress.value = percent;
+    this.downloadProgress.textContent = `${percent.toFixed(1)}%`;
+    this.downloadDetail.textContent = complete
+      ? `${fileName} · ${PlayerDebugPanel._formatBytes(totalBytes)} · 已完成`
+      : `${fileName} · ${PlayerDebugPanel._formatBytes(loadedBytes)}`
+        + ` / ${PlayerDebugPanel._formatBytes(totalBytes)} · ${percent.toFixed(1)}%`;
   }
 
   updateVideoInfo(videoInfo) {

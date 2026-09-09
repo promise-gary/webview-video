@@ -29,8 +29,6 @@ export class RendererFactory {
         return await WebGpuRenderer.create(canvas);
       } catch (error) {
         webGpuError = error;
-        console.warn('WebGPU 初始化失败，切换到 WebGL。', error);
-
         /**
          * 一个 Canvas 一旦成功调用 getContext('webgpu')，就不能再对同一个
          * Canvas 获取 webgl context。WebGPU 可能在创建 context 之后、创建
@@ -43,16 +41,7 @@ export class RendererFactory {
     }
 
     try {
-      const renderer = WebGlRenderer.create(canvas);
-
-      /**
-       * 只有“尝试过 WebGPU 但失败”才属于降级。
-       * 主动关闭 WebGPU 时直接选择 WebGL，不应向 UI 报告失败。
-       */
-      renderer.fallbackReason = webGpuEnabled
-        ? webGpuError?.message ?? ''
-        : '';
-      return renderer;
+      return WebGlRenderer.create(canvas);
     } catch (webGlError) {
       const webGpuMessage = webGpuEnabled
         ? webGpuError?.message ?? '当前环境没有 WebGPU'

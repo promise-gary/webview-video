@@ -60,11 +60,43 @@ canvas {
   color: #dce3ef;
 }
 
-.debug-info {
+.debug-info,
+.download-info {
   font-size: 12px;
   line-height: 1.5;
 }
 
 .debug-info.error {
   color: #fca5a5;
+}
+
+.download-info {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 6px;
+  color: #9da9bc;
+}
+
+#download-progress {
+  display: block;
+  width: 100%;
+  height: 6px;
+  margin-top: 5px;
+  overflow: hidden;
+  border: 0;
+  border-radius: 999px;
+  background: #303746;
+  accent-color: #78a6ff;
+}
+
+#download-progress::-webkit-progress-bar {
+  border-radius: 999px;
+  background: #303746;
+}
+
+#download-progress::-webkit-progress-value,
+#download-progress::-moz-progress-bar {
+  border-radius: 999px;
+  background: #78a6ff;
 }

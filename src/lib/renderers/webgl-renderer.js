@@ -2,8 +2,8 @@
  * WebGL 兼容渲染后端。
  *
  * 输入和 WebGPU Renderer 相同：一对 Color/Alpha VideoFrame。
- * 区别是这里通过 texImage2D() 将 VideoFrame 内容更新到两张普通 WebGL
- * Texture，再用 GLSL Fragment Shader 合成最终 RGBA。
+ * 区别是这里通过 texSubImage2D() 将 VideoFrame 内容更新到两张预分配的
+ * WebGL Texture，再用 GLSL Fragment Shader 合成最终 RGBA。
  */
 export class WebGlRenderer {
   /**
@@ -27,8 +27,9 @@ export class WebGlRenderer {
     this.name = 'WebGL';
     this.program = this._createProgram();
     this.buffer = this._createBuffer();
-    this.colorTexture = this._createTexture(gl.TEXTURE0);
-    this.alphaTexture = this._createTexture(gl.TEXTURE1);
+    this.colorTexture = this._createTexture(gl.TEXTURE0, canvas.width, canvas.height);
+    this.alphaTexture = this._createTexture(gl.TEXTURE1, canvas.width, canvas.height);
+    this.destroyed = false;
 
     gl.useProgram(this.program);
     gl.uniform1i(gl.getUniformLocation(this.program, 'u_color'), 0);
@@ -40,10 +41,12 @@ export class WebGlRenderer {
   /**
    * 把一对 VideoFrame 上传为两张纹理并绘制。
    *
-   * texImage2D() 可能触发像素格式转换或纹理复制，但兼容性通常比
+   * texSubImage2D() 可能触发像素格式转换或纹理复制，但不会每帧重新分配
+   * 纹理存储，且兼容性通常比
    * WebGPU importExternalTexture() 更广。该方法完成后 Player 即可关闭帧。
    */
   async render(pair) {
+    if (this.destroyed) throw new Error('WebGL Renderer 已释放。');
     const gl = this.gl;
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
 
@@ -65,16 +68,28 @@ export class WebGlRenderer {
     const gl = this.gl;
     gl.activeTexture(unit);
     gl.bindTexture(gl.TEXTURE_2D, texture);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, frame);
+    gl.texSubImage2D(
+      gl.TEXTURE_2D,
+      0,
+      0,
+      0,
+      gl.RGBA,
+      gl.UNSIGNED_BYTE,
+      frame
+    );
   }
 
   // 显式删除由本 Renderer 创建的 WebGL 对象。
   destroy() {
+    if (this.destroyed) return;
+    this.destroyed = true;
     const gl = this.gl;
+    gl.finish();
     gl.deleteTexture(this.colorTexture);
     gl.deleteTexture(this.alphaTexture);
     gl.deleteBuffer(this.buffer);
     gl.deleteProgram(this.program);
+    gl.getExtension('WEBGL_lose_context')?.loseContext();
   }
 
   /**
@@ -167,8 +182,8 @@ export class WebGlRenderer {
     return buffer;
   }
 
-  // 两张纹理只创建一次；每帧通过 texImage2D() 更新其内容。
-  _createTexture(unit) {
+  // 两张纹理只分配一次；每帧通过 texSubImage2D() 更新其内容。
+  _createTexture(unit, width, height) {
     const gl = this.gl;
     const texture = gl.createTexture();
     gl.activeTexture(unit);
@@ -177,6 +192,17 @@ export class WebGlRenderer {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texImage2D(
+      gl.TEXTURE_2D,
+      0,
+      gl.RGBA,
+      width,
+      height,
+      0,
+      gl.RGBA,
+      gl.UNSIGNED_BYTE,
+      null
+    );
     return texture;
   }
 }

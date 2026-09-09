@@ -16,10 +16,7 @@ export class WebGpuRenderer {
   static async create(canvas) {
     if (!navigator.gpu) throw new Error('WebGPU 不可用。');
 
-    // 高性能是偏好而非保证，系统仍可能选择集成 GPU 或唯一可用 GPU。
-    const adapter = await navigator.gpu.requestAdapter({
-      powerPreference: 'high-performance',
-    });
+    const adapter = await navigator.gpu.requestAdapter();
     if (!adapter) throw new Error('无法获取 WebGPU Adapter。');
 
     const device = await adapter.requestDevice();
@@ -124,8 +121,10 @@ export class WebGpuRenderer {
     this.device = device;
     this.context = context;
     this.pipeline = pipeline;
+    this.bindGroupLayout = pipeline.getBindGroupLayout(0);
     this.sampler = sampler;
     this.name = 'WebGPU';
+    this.destroyed = false;
   }
 
   /**
@@ -135,6 +134,7 @@ export class WebGpuRenderer {
    * Promise settle 后关闭 VideoFrame，保证外部纹理使用期间源帧仍然有效。
    */
   async render(pair) {
+    if (this.destroyed) throw new Error('WebGPU Renderer 已释放。');
     const device = this.device;
 
     /**
@@ -142,7 +142,7 @@ export class WebGpuRenderer {
      * 它的生命周期受源 VideoFrame 约束，因此每一帧都需要重新导入。
      */
     const bindGroup = device.createBindGroup({
-      layout: this.pipeline.getBindGroupLayout(0),
+      layout: this.bindGroupLayout,
       entries: [
         { binding: 0, resource: this.sampler },
         {
@@ -180,6 +180,9 @@ export class WebGpuRenderer {
 
   // Device 是该 Renderer 创建的最终 GPU 资源，销毁它会释放其子资源。
   destroy() {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    if (typeof this.context.unconfigure === 'function') this.context.unconfigure();
     this.device.destroy();
   }
 }

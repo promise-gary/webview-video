@@ -71,6 +71,7 @@ const FALLBACK_AUDIO_DURATION_US = 20_000;
 export class WebmDemuxer {
   /**
    * @param {ArrayBuffer} buffer 完整 WebM 文件。
+   * @param {{ audioEnabled?: boolean }} options 解析开关。
    * @returns {{
    *   frames: Array<{
    *     timestamp: number,
@@ -97,24 +98,28 @@ export class WebmDemuxer {
    *   }
    * }}
    */
-  static parse(buffer) {
+  static parse(buffer, { audioEnabled = true } = {}) {
     // Uint8Array 只建立视图，不复制完整文件；各帧 data 也继续引用该缓冲区。
     const bytes = new Uint8Array(buffer);
 
     // 第一阶段读取容器元数据，得到时间基和音视频 TrackNumber。
     const segment = this._findSegment(bytes);
-    const segmentChildren = [...this._children(bytes, segment)];
-    const info = segmentChildren.find((element) => element.id === ID.INFO);
-    const tracks = segmentChildren.find((element) => element.id === ID.TRACKS);
+    let info = null;
+    let tracks = null;
+    for (const element of this._children(bytes, segment)) {
+      if (element.id === ID.INFO) info = element;
+      if (element.id === ID.TRACKS) tracks = element;
+      if (info && tracks) break;
+    }
     if (!info || !tracks) throw new Error('WebM 缺少 Info 或 Tracks。');
 
     const timecodeScaleNs = this._readTimecodeScale(bytes, info);
-    const { videoTrack, audioTrack } = this._readTracks(bytes, tracks);
+    const { videoTrack, audioTrack } = this._readTracks(bytes, tracks, audioEnabled);
     // 第二阶段遍历全部 Cluster，把交织存储的音视频压缩块分别放入两个时间轴。
     const frames = [];
-    const audioChunks = [];
+    const audioChunks = audioTrack ? [] : null;
 
-    for (const cluster of segmentChildren) {
+    for (const cluster of this._children(bytes, segment)) {
       if (cluster.id !== ID.CLUSTER) continue;
       const clusterStreams = this._readCluster(
         bytes,
@@ -124,7 +129,7 @@ export class WebmDemuxer {
         timecodeScaleNs
       );
       frames.push(...clusterStreams.frames);
-      audioChunks.push(...clusterStreams.audioChunks);
+      if (audioChunks) audioChunks.push(...clusterStreams.audioChunks);
     }
 
     // Cluster 一般按时间排列，但显式排序可以避免依赖封装器的写入顺序。
@@ -137,7 +142,7 @@ export class WebmDemuxer {
 
     // WebCodecs chunk 最好带 duration；容器未写时根据下一个 timestamp 推导。
     this._fillFrameDurations(frames);
-    this._fillChunkDurations(audioChunks, FALLBACK_AUDIO_DURATION_US);
+    if (audioChunks) this._fillChunkDurations(audioChunks, FALLBACK_AUDIO_DURATION_US);
     return {
       frames,
       width: videoTrack.width,
@@ -179,11 +184,21 @@ export class WebmDemuxer {
   }
 
   // 读取本 Demo 支持的唯一 VP9 Alpha 视频轨，以及可选的唯一 Opus 音频轨。
-  static _readTracks(bytes, tracks) {
+  static _readTracks(bytes, tracks, audioEnabled) {
     const videoTracks = [];
-    const audioTracks = [];
+    const audioTracks = audioEnabled ? [] : null;
     for (const entry of this._children(bytes, tracks)) {
       if (entry.id !== ID.TRACK_ENTRY) continue;
+
+      let entryType = 0;
+      for (const element of this._children(bytes, entry)) {
+        if (element.id !== ID.TRACK_TYPE) continue;
+        entryType = this._readUnsigned(bytes, element);
+        break;
+      }
+      if (entryType !== VIDEO_TRACK_TYPE && (!audioEnabled || entryType !== AUDIO_TRACK_TYPE)) {
+        continue;
+      }
 
       let number = 0;
       let type = 0;
@@ -211,7 +226,7 @@ export class WebmDemuxer {
 
       if (type === VIDEO_TRACK_TYPE) {
         videoTracks.push({ number, codecId, ...video });
-      } else if (type === AUDIO_TRACK_TYPE) {
+      } else if (type === AUDIO_TRACK_TYPE && audioTracks) {
         audioTracks.push({ number, codecId, codecPrivate, ...audio });
       }
     }
@@ -231,10 +246,10 @@ export class WebmDemuxer {
       throw new Error('视频轨必须是带 AlphaMode 的有效 VP9 轨道。');
     }
 
-    if (audioTracks.length > 1) {
+    if (audioTracks && audioTracks.length > 1) {
       throw new Error(`Demo 最多支持一个音频轨，当前为 ${audioTracks.length} 个。`);
     }
-    const audioTrack = audioTracks[0] ?? null;
+    const audioTrack = audioTracks?.[0] ?? null;
     if (
       audioTrack
       && (
@@ -291,17 +306,22 @@ export class WebmDemuxer {
     audioTrackNumber,
     timecodeScaleNs
   ) {
-    const children = [...this._children(bytes, cluster)];
-    const timecodeElement = children.find(
-      (element) => element.id === ID.CLUSTER_TIMECODE
-    );
+    let timecodeElement = null;
+    for (const element of this._children(bytes, cluster)) {
+      if (element.id !== ID.CLUSTER_TIMECODE) continue;
+      timecodeElement = element;
+      break;
+    }
     if (!timecodeElement) throw new Error('Cluster 缺少 Timecode。');
     const clusterTimecode = this._readUnsigned(bytes, timecodeElement);
     const frames = [];
-    const audioChunks = [];
+    const audioChunks = audioTrackNumber ? [] : null;
 
-    for (const element of children) {
+    for (const element of this._children(bytes, cluster)) {
       if (element.id === ID.BLOCK_GROUP) {
+        const blockElement = this._findBlock(bytes, element);
+        const track = this._readVint(bytes, blockElement.dataOffset, false);
+        if (track.value !== videoTrackNumber && track.value !== audioTrackNumber) continue;
         // 带 Alpha 的视频必须使用 BlockGroup，才能同时携带 BlockAdditional。
         const group = this._readBlockGroup(bytes, element);
         const timestamp = this._toMicroseconds(
@@ -328,13 +348,15 @@ export class WebmDemuxer {
               type: this._frameType(group.alphaData),
             },
           });
-        } else if (group.trackNumber === audioTrackNumber) {
+        } else if (audioChunks && group.trackNumber === audioTrackNumber) {
           audioChunks.push(this._createAudioChunk(group, timestamp, duration));
         }
       } else if (element.id === ID.SIMPLE_BLOCK) {
+        const track = this._readVint(bytes, element.dataOffset, false);
+        if (track.value !== videoTrackNumber && track.value !== audioTrackNumber) continue;
         // ffmpeg 生成的 Opus packet 使用更轻量的 SimpleBlock，不含 Alpha 附加数据。
         const block = this._readBlock(bytes, element);
-        if (block.trackNumber === audioTrackNumber) {
+        if (audioChunks && block.trackNumber === audioTrackNumber) {
           const timestamp = this._toMicroseconds(
             clusterTimecode + block.relativeTimecode,
             timecodeScaleNs
@@ -346,6 +368,13 @@ export class WebmDemuxer {
       }
     }
     return { frames, audioChunks };
+  }
+
+  static _findBlock(bytes, blockGroup) {
+    for (const element of this._children(bytes, blockGroup)) {
+      if (element.id === ID.BLOCK) return element;
+    }
+    throw new Error('BlockGroup 缺少 Block。');
   }
 
   // 将 BlockGroup 还原成“主压缩块 + 可选 Alpha + 可选 duration”。
