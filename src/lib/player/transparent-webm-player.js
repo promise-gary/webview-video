@@ -17,17 +17,26 @@ const NOOP = () => {};
 export class TransparentWebmPlayer {
   constructor({
     canvas,
+    renderer = null,
+    reuseRenderer = false,
     audioEnabled = false,
     webGpuEnabled = true,
+    diagnostics,
+    fileName,
+    onRendererCreated = NOOP,
     onVideoInfoChange = NOOP,
   }) {
     this.canvas = canvas;
+    this.renderer = renderer;
+    this.reuseRenderer = reuseRenderer;
     this.audioEnabled = audioEnabled;
     this.webGpuEnabled = webGpuEnabled;
+    this.diagnostics = diagnostics;
+    this.fileName = fileName;
+    this.onRendererCreated = onRendererCreated;
     this.onVideoInfoChange = onVideoInfoChange;
 
     this.store = new EncodedMediaStore();
-    this.renderer = null;
     this.decoder = null;
     this.audioClock = null;
     this.nextFrameIndex = 0;
@@ -43,6 +52,8 @@ export class TransparentWebmPlayer {
     this.currentTimeUs = 0;
     this.playbackStartedAt = 0;
     this.animationId = 0;
+    this.renderedFrameCount = 0;
+    this.lastStatsLoggedAt = 0;
 
     this.playing = false;
     this.started = false;
@@ -67,6 +78,10 @@ export class TransparentWebmPlayer {
     if (this.ready || this.store.metadata) throw new Error('播放器已经加载过媒体。');
 
     try {
+      this.diagnostics.info('player.load.begin', {
+        fileName: this.fileName,
+        mediaBytes: mediaData.byteLength,
+      });
       if (!('VideoDecoder' in window) || !('EncodedVideoChunk' in window)) {
         throw new Error('当前环境不支持 VideoDecoder。');
       }
@@ -75,6 +90,13 @@ export class TransparentWebmPlayer {
         audioEnabled: this.audioEnabled,
       });
       this.store.load(media);
+      this.diagnostics.info('player.demux.complete', {
+        fileName: this.fileName,
+        width: media.width,
+        height: media.height,
+        frames: media.frames.length,
+        durationUs: media.duration,
+      });
       this.onVideoInfoChange(this._createVideoInfo());
       await this._initializeMedia();
       this.ready = true;
@@ -86,8 +108,10 @@ export class TransparentWebmPlayer {
       this._submitFrame(this.store.frames[0]);
       await firstFrameReady;
       this._assertLoadingActive();
+      this.diagnostics.info('player.first-frame.complete', { fileName: this.fileName });
       return this._createLoadInfo();
     } catch (error) {
+      this.diagnostics.error('player.load.failed', error, { fileName: this.fileName });
       this._fail(error);
       throw error;
     }
@@ -111,6 +135,7 @@ export class TransparentWebmPlayer {
     if (this.failed || this.disposed) return;
     this.playbackStartedAt = performance.now();
     this.playing = true;
+    this.diagnostics.info('player.play.begin', { fileName: this.fileName });
     const playbackComplete = new Promise((resolve, reject) => {
       this.playbackResolve = resolve;
       this.playbackReject = reject;
@@ -122,11 +147,17 @@ export class TransparentWebmPlayer {
 
   /**
    * 幂等释放本视频拥有的全部显式资源，并断开完整媒体 ArrayBuffer 的引用。
+   * 共享 Renderer 由串行控制器负责销毁，播放器只在段末清空其输出。
    * JS Heap 的实际归还时机由 WebView 的垃圾回收器决定。
    */
   dispose() {
     if (this.disposePromise) return this.disposePromise;
     this.disposed = true;
+    this.diagnostics.info('player.dispose.begin', {
+      fileName: this.fileName,
+      decodedFrames: this.decodedFrames.length,
+      framesInFlight: this.framesInFlight,
+    });
     this.ready = false;
     this.playing = false;
     cancelAnimationFrame(this.animationId);
@@ -161,7 +192,11 @@ export class TransparentWebmPlayer {
     await this._waitForRenderIdle();
     let rendererError = null;
     try {
-      this.renderer?.destroy();
+      if (this.reuseRenderer) {
+        await this.renderer?.clear();
+      } else {
+        this.renderer?.destroy();
+      }
     } catch (error) {
       rendererError = error;
     } finally {
@@ -169,6 +204,7 @@ export class TransparentWebmPlayer {
       this.store.clear();
       this.audioClock = null;
       this.renderer = null;
+      this.diagnostics.info('player.dispose.complete', { fileName: this.fileName });
     }
     if (rendererError) throw rendererError;
   }
@@ -176,27 +212,35 @@ export class TransparentWebmPlayer {
   async _initializeMedia() {
     this._assertLoadingActive();
     const metadata = this.store.metadata;
-    this.canvas.width = metadata.width;
-    this.canvas.height = metadata.height;
-    const rendererCreationPromise = RendererFactory.create(this.canvas, {
-      webGpuEnabled: this.webGpuEnabled,
-    });
-    this.rendererCreationPromise = rendererCreationPromise;
-    let renderer;
-    try {
-      renderer = await rendererCreationPromise;
-    } finally {
-      if (this.rendererCreationPromise === rendererCreationPromise) {
-        this.rendererCreationPromise = null;
+    let renderer = this.renderer;
+    const reusedRenderer = Boolean(renderer);
+    if (renderer) {
+      this.canvas = renderer.canvas;
+      await renderer.resize(metadata.width, metadata.height);
+    } else {
+      this.canvas.width = metadata.width;
+      this.canvas.height = metadata.height;
+      const rendererCreationPromise = RendererFactory.create(this.canvas, {
+        webGpuEnabled: this.webGpuEnabled,
+        diagnostics: this.diagnostics,
+      });
+      this.rendererCreationPromise = rendererCreationPromise;
+      try {
+        renderer = await rendererCreationPromise;
+      } finally {
+        if (this.rendererCreationPromise === rendererCreationPromise) {
+          this.rendererCreationPromise = null;
+        }
       }
     }
     if (this.disposed || this.failed) {
-      renderer.destroy();
+      if (!reusedRenderer) renderer.destroy();
       this._assertLoadingActive();
     }
     this.renderer = renderer;
     // RendererFactory 在 WebGPU 初始化后失败时可能替换 Canvas。
     this.canvas = this.renderer.canvas;
+    if (this.reuseRenderer && !reusedRenderer) this.onRendererCreated(this.renderer);
     const decoderConfig = await this._getDecoderConfig(
       metadata.codec,
       metadata.codedWidth,
@@ -204,6 +248,12 @@ export class TransparentWebmPlayer {
     );
     this._assertLoadingActive();
     this._createDecoder(decoderConfig);
+    this.diagnostics.info('player.decoder.configured', {
+      fileName: this.fileName,
+      codec: decoderConfig.codec,
+      width: decoderConfig.codedWidth,
+      height: decoderConfig.codedHeight,
+    });
 
     if (!this.audioEnabled) return;
     if (!metadata.audio) throw new Error('启用音频时，WebM 必须包含 Opus 音轨。');
@@ -261,6 +311,13 @@ export class TransparentWebmPlayer {
       optimizeForLatency: true,
     });
     if (!support.supported) throw new Error(`当前环境不支持 ${codec}。`);
+    this.diagnostics.info('player.decoder.supported', {
+      fileName: this.fileName,
+      codec,
+      width,
+      height,
+      hardwareAcceleration: support.config.hardwareAcceleration ?? 'default',
+    });
     return support.config;
   }
 
@@ -293,6 +350,7 @@ export class TransparentWebmPlayer {
     this.decodedFrames.sort((left, right) => left.timestamp - right.timestamp);
     // 首帧时间戳不一定严格为 0，load 仍必须等待它完成实际渲染。
     if (!this.playing && !this.firstFrameRendered) this._drawThrough(frame.timestamp);
+    this._logStats();
   }
 
   _decodeAhead() {
@@ -327,6 +385,7 @@ export class TransparentWebmPlayer {
 
     this._drawThrough(this.currentTimeUs);
     this._decodeAhead();
+    this._logStats();
     if (
       this.currentTimeUs >= this._getDurationUs()
       && this.decodersFlushed
@@ -390,7 +449,9 @@ export class TransparentWebmPlayer {
   async _renderFrame(frame) {
     try {
       await this.renderer.render(frame);
+      this.renderedFrameCount += 1;
       if (!this.firstFrameRendered && !this.failed && !this.disposed) {
+        await this.renderer.flush?.();
         this.firstFrameRendered = true;
         this.firstFrameResolve?.();
         this.firstFrameResolve = null;
@@ -399,7 +460,7 @@ export class TransparentWebmPlayer {
     } catch (error) {
       this._fail(error);
     } finally {
-      frame.close();
+      if (!this.renderer?.ownsFrames) frame.close();
     }
   }
 
@@ -413,21 +474,32 @@ export class TransparentWebmPlayer {
     this.playing = false;
     this.audioClock?.stop();
     this.animationId = 0;
+    this.diagnostics.info('player.play.finish', {
+      fileName: this.fileName,
+      renderedFrames: this.renderedFrameCount,
+    });
     void this._completePlayback();
   }
 
   async _completePlayback() {
-    await this._waitForRenderIdle();
-    if (this.failed || this.disposed) return;
-    this.playbackResolve?.();
-    this.playbackResolve = null;
-    this.playbackReject = null;
+    try {
+      await this._waitForRenderIdle();
+      await this.renderer.flush?.();
+      if (this.failed || this.disposed) return;
+      this.playbackResolve?.();
+      this.playbackResolve = null;
+      this.playbackReject = null;
+      this.diagnostics.info('player.play.complete', { fileName: this.fileName });
+    } catch (error) {
+      this._fail(error);
+    }
   }
 
   _drainDecoder() {
     if (this.decoderDrainPromise || this.decodersFlushed) return;
     const decoder = this.decoder;
     if (decoder?.state !== 'configured') return;
+    this.diagnostics.info('player.decoder.flush.begin', { fileName: this.fileName });
     const drainPromise = decoder.flush()
       .then(() => {
         if (this.disposed || this.failed) return;
@@ -436,6 +508,7 @@ export class TransparentWebmPlayer {
         }
         this.decodersFlushed = true;
         this._closeDecoder();
+        this.diagnostics.info('player.decoder.flush.complete', { fileName: this.fileName });
       });
     this.decoderDrainPromise = drainPromise;
     void drainPromise.catch((error) => this._fail(error));
@@ -453,6 +526,11 @@ export class TransparentWebmPlayer {
 
   _fail(error) {
     if (this.failed || this.disposed) return;
+    this.diagnostics.error('player.failed', error, {
+      fileName: this.fileName,
+      decodedFrames: this.decodedFrames.length,
+      framesInFlight: this.framesInFlight,
+    });
     this.failed = true;
     this.playing = false;
     cancelAnimationFrame(this.animationId);
@@ -483,6 +561,20 @@ export class TransparentWebmPlayer {
     const decoder = this.decoder;
     this.decoder = null;
     if (decoder && decoder.state !== 'closed') decoder.close();
+    this.diagnostics.info('player.decoder.closed', { fileName: this.fileName });
+  }
+
+  _logStats() {
+    const now = performance.now();
+    if (now - this.lastStatsLoggedAt < 1_000) return;
+    this.lastStatsLoggedAt = now;
+    this.diagnostics.info('player.stats', {
+      fileName: this.fileName,
+      renderedFrames: this.renderedFrameCount,
+      decodedFrames: this.decodedFrames.length,
+      framesInFlight: this.framesInFlight,
+      hasPendingRenderFrame: Boolean(this.pendingRenderFrame),
+    });
   }
 
   static _toArrayBuffer(mediaData) {

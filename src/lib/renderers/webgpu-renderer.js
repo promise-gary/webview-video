@@ -13,13 +13,19 @@ export class WebGpuRenderer {
    * 异步创建 Adapter、Device、Canvas Context 和 RenderPipeline。
    * 任意步骤失败都会抛出，由 RendererFactory 尝试 WebGL。
    */
-  static async create(canvas) {
+  static async create(canvas, { diagnostics }) {
     if (!navigator.gpu) throw new Error('WebGPU 不可用。');
 
     const adapter = await navigator.gpu.requestAdapter();
     if (!adapter) throw new Error('无法获取 WebGPU Adapter。');
+    diagnostics.info('webgpu.adapter.ready', {
+      maxTextureDimension2D: adapter.limits.maxTextureDimension2D,
+    });
 
     const device = await adapter.requestDevice();
+    diagnostics.info('webgpu.device.ready', {
+      maxTextureDimension2D: device.limits.maxTextureDimension2D,
+    });
 
     // 当前方案必须直接采样 VideoFrame，因此不能只检查 navigator.gpu。
     if (typeof device.importExternalTexture !== 'function') {
@@ -37,6 +43,7 @@ export class WebGpuRenderer {
        * premultiplied，避免浏览器合成 Canvas 时再次错误处理透明颜色。
        */
       context.configure({ device, format, alphaMode: 'premultiplied' });
+      diagnostics.info('webgpu.context.configured', { format });
 
       const module = device.createShaderModule({
         code: `
@@ -108,7 +115,9 @@ export class WebGpuRenderer {
         device,
         context,
         pipeline,
-        device.createSampler({ magFilter: 'linear', minFilter: 'linear' })
+        device.createSampler({ magFilter: 'linear', minFilter: 'linear' }),
+        format,
+        diagnostics
       );
     } catch (error) {
       // 初始化中途失败时主动销毁 Device，再由 Factory 创建 WebGL。
@@ -117,69 +126,185 @@ export class WebGpuRenderer {
     }
   }
 
-  constructor(canvas, device, context, pipeline, sampler) {
+  constructor(canvas, device, context, pipeline, sampler, format, diagnostics) {
     this.canvas = canvas;
     this.device = device;
     this.context = context;
     this.pipeline = pipeline;
     this.bindGroupLayout = pipeline.getBindGroupLayout(0);
     this.sampler = sampler;
+    this.format = format;
+    this.diagnostics = diagnostics;
     this.name = 'WebGPU';
+    this.ownsFrames = true;
     this.destroyed = false;
+    this.deviceLost = false;
+    this.renderingFailed = false;
+    this.pendingFrames = [];
+    this.fenceCount = 0;
+    this.totalFenceWaitMs = 0;
+    this.maxFenceWaitMs = 0;
+    this.lastFenceStatsLoggedAt = 0;
+
+    device.lost.then((info) => {
+      this.deviceLost = true;
+      if (diagnostics.enabled) {
+        const data = {
+          reason: info.reason,
+          message: info.message,
+          intentionallyDestroyed: this.destroyed,
+        };
+        if (info.reason === 'destroyed') this.diagnostics.info('webgpu.device.lost', data);
+        else this.diagnostics.error('webgpu.device.lost', new Error(info.message), data);
+      }
+    });
+    if (diagnostics.enabled) {
+      device.onuncapturederror = (event) => {
+        this.diagnostics.error('webgpu.uncaptured-error', event.error);
+      };
+    }
+  }
+
+  get isAvailable() {
+    return !this.destroyed && !this.deviceLost && !this.renderingFailed;
+  }
+
+  resize(width, height) {
+    if (!this.isAvailable) throw new Error('WebGPU Renderer 不可用。');
+    if (this.canvas.width === width && this.canvas.height === height) return;
+    this.canvas.width = width;
+    this.canvas.height = height;
+    this.context.configure({
+      device: this.device,
+      format: this.format,
+      alphaMode: 'premultiplied',
+    });
+    this.diagnostics.info('webgpu.canvas.resized', { canvasSize: [width, height] });
   }
 
   /**
    * 渲染一张左右拼接的 VideoFrame。
    *
-   * Promise 只有在 GPU 已完成本次之前提交的工作后才结束。Player 会等待
-   * Promise settle 后关闭 VideoFrame，保证外部纹理使用期间源帧仍然有效。
+   * 每两帧才等待一次 GPU 完成。Renderer 会持有该批次的 VideoFrame，直到
+   * GPU 完成后才关闭，保证外部纹理使用期间源帧仍然有效。
    */
   async render(frame) {
-    if (this.destroyed) throw new Error('WebGPU Renderer 已释放。');
+    if (!this.isAvailable) throw new Error('WebGPU Renderer 不可用。');
     const device = this.device;
 
     /**
      * GPUExternalTexture 是 VideoFrame 的临时 GPU 视图，而不是永久纹理。
      * 它的生命周期受源 VideoFrame 约束，因此每一帧都需要重新导入。
      */
-    const bindGroup = device.createBindGroup({
-      layout: this.bindGroupLayout,
-      entries: [
-        { binding: 0, resource: this.sampler },
-        {
-          binding: 1,
-          resource: device.importExternalTexture({ source: frame }),
-        },
-      ],
-    });
+    try {
+      const bindGroup = device.createBindGroup({
+        layout: this.bindGroupLayout,
+        entries: [
+          { binding: 0, resource: this.sampler },
+          {
+            binding: 1,
+            resource: device.importExternalTexture({ source: frame }),
+          },
+        ],
+      });
 
-    // CommandEncoder 用于记录本帧所有 GPU 命令。
-    const encoder = device.createCommandEncoder();
-    const pass = encoder.beginRenderPass({
-      colorAttachments: [{
-        view: this.context.getCurrentTexture().createView(),
+      // CommandEncoder 用于记录本帧所有 GPU 命令。
+      const encoder = device.createCommandEncoder();
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [{
+          view: this.context.getCurrentTexture().createView(),
 
-        // 在 GPU RenderPass 中清成完全透明，不经过 Canvas 2D clearRect。
-        clearValue: { r: 0, g: 0, b: 0, a: 0 },
-        loadOp: 'clear',
-        storeOp: 'store',
-      }],
-    });
-    pass.setPipeline(this.pipeline);
-    pass.setBindGroup(0, bindGroup);
-    pass.draw(6);
-    pass.end();
-    device.queue.submit([encoder.finish()]);
+          // 在 GPU RenderPass 中清成完全透明，不经过 Canvas 2D clearRect。
+          clearValue: { r: 0, g: 0, b: 0, a: 0 },
+          loadOp: 'clear',
+          storeOp: 'store',
+        }],
+      });
+      pass.setPipeline(this.pipeline);
+      pass.setBindGroup(0, bindGroup);
+      pass.draw(6);
+      pass.end();
+      device.queue.submit([encoder.finish()]);
+    } catch (error) {
+      this.renderingFailed = true;
+      frame.close();
+      throw error;
+    }
 
-    // Player 在该 Promise 完成后关闭 VideoFrame。
-    await device.queue.onSubmittedWorkDone();
+    this.pendingFrames.push(frame);
+    if (this.pendingFrames.length < 2) return;
+    await this.flush();
+  }
+
+  async flush() {
+    if (!this.pendingFrames.length) return;
+    const frames = this.pendingFrames;
+    this.pendingFrames = [];
+    const startedAt = performance.now();
+    try {
+      await this.device.queue.onSubmittedWorkDone();
+    } catch (error) {
+      this.renderingFailed = true;
+      throw error;
+    } finally {
+      const waitMs = performance.now() - startedAt;
+      this.fenceCount += 1;
+      this.totalFenceWaitMs += waitMs;
+      this.maxFenceWaitMs = Math.max(this.maxFenceWaitMs, waitMs);
+      this._logFenceStats();
+      for (const frame of frames) frame.close();
+    }
+  }
+
+  async clear() {
+    if (!this.isAvailable) return;
+    await this.flush();
+    if (!this.isAvailable) return;
+    try {
+      const encoder = this.device.createCommandEncoder();
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [{
+          view: this.context.getCurrentTexture().createView(),
+          clearValue: { r: 0, g: 0, b: 0, a: 0 },
+          loadOp: 'clear',
+          storeOp: 'store',
+        }],
+      });
+      pass.end();
+      this.device.queue.submit([encoder.finish()]);
+      await this.device.queue.onSubmittedWorkDone();
+    } catch (error) {
+      this.renderingFailed = true;
+      throw error;
+    }
   }
 
   // Device 是该 Renderer 创建的最终 GPU 资源，销毁它会释放其子资源。
   destroy() {
     if (this.destroyed) return;
     this.destroyed = true;
+    this.diagnostics.info('webgpu.destroy.begin', {
+      pendingFrames: this.pendingFrames.length,
+      fenceCount: this.fenceCount,
+      averageFenceWaitMs: this.fenceCount ? this.totalFenceWaitMs / this.fenceCount : 0,
+      maxFenceWaitMs: this.maxFenceWaitMs,
+    });
     if (typeof this.context.unconfigure === 'function') this.context.unconfigure();
     this.device.destroy();
+    for (const frame of this.pendingFrames) frame.close();
+    this.pendingFrames = [];
+    this.diagnostics.info('webgpu.destroy.complete');
+  }
+
+  _logFenceStats() {
+    const now = performance.now();
+    if (now - this.lastFenceStatsLoggedAt < 1_000) return;
+    this.lastFenceStatsLoggedAt = now;
+    this.diagnostics.info('webgpu.fence.stats', {
+      fenceCount: this.fenceCount,
+      averageWaitMs: this.totalFenceWaitMs / this.fenceCount,
+      maxWaitMs: this.maxFenceWaitMs,
+      pendingFrames: this.pendingFrames.length,
+    });
   }
 }

@@ -1,5 +1,6 @@
 import { PlayerBridge } from './bridge/player-bridge.js';
 import { ErrorHandler } from './error/error.js';
+import { PlayerDiagnostics } from './lib/debug/player-diagnostics.js';
 import { PlayerDebugPanel } from './lib/debug/player-debug-panel.js';
 import { SerialVideoController } from './lib/player/serial-video-controller.js';
 
@@ -19,17 +20,41 @@ const canvasHost = document.querySelector('.player');
 const canvas = document.querySelector('#video-canvas');
 const debugLayer = document.querySelector('#debug-layer');
 const debugEnabled = new URL(window.location.href).searchParams.get('debug') === 'true';
+const playerBridge = new PlayerBridge();
+const diagnostics = PlayerDiagnostics.create({
+  enabled: debugEnabled,
+  bridge: playerBridge,
+});
+diagnostics.info('page.ready', {
+  webGpuAvailable: Boolean(navigator.gpu),
+  videoDecoderAvailable: 'VideoDecoder' in window,
+  encodedVideoChunkAvailable: 'EncodedVideoChunk' in window,
+  userAgent: navigator.userAgent,
+});
+diagnostics.sampleMemory('page.ready');
+if (debugEnabled) {
+  window.addEventListener('error', (event) => {
+    diagnostics.error(
+      'window.error',
+      event.error instanceof Error ? event.error : new Error(event.message),
+      { fileName: event.filename, line: event.lineno, column: event.colno }
+    );
+  });
+  window.addEventListener('unhandledrejection', (event) => {
+    diagnostics.error('window.unhandled-rejection', event.reason);
+  });
+}
 const playerDebugPanel = PlayerDebugPanel.create({
   enabled: debugEnabled,
   parent: debugLayer,
 });
-const playerBridge = new PlayerBridge();
 const errorHandler = new ErrorHandler({ bridge: playerBridge });
 const controller = new SerialVideoController({
   canvas,
   canvasHost,
   resources,
   errorHandler,
+  diagnostics,
   playerOptions: {
     audioEnabled: false,
     webGpuEnabled: true,
