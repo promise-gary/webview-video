@@ -4,7 +4,7 @@ import { PlayerDiagnostics } from './lib/debug/player-diagnostics.js';
 import { PlayerDebugPanel } from './lib/debug/player-debug-panel.js';
 import { SerialVideoController } from './lib/player/serial-video-controller.js';
 
-const RESOURCE_BASE_URL = 'https://downloadcdn.oopz.cn/video_test_20260902';
+const RESOURCE_BASE_URL = 'https://192.168.1.2:3000/video';
 const RESOURCE_QUALITIES = Object.freeze(['low', 'standard', 'high']);
 const resources = [];
 for (let number = 1; number <= 134; number += 1) {
