@@ -10,20 +10,21 @@ export class WebGlRenderer {
    * WebGL 是本 Demo 的最终回退层。
    * premultipliedAlpha=false 表示 Shader 输出未经预乘的 RGB + Alpha。
    */
-  static create(canvas) {
+  static create(canvas, { diagnostics }) {
     const gl = canvas.getContext('webgl', {
       alpha: true,
       antialias: false,
       premultipliedAlpha: false,
     });
     if (!gl) throw new Error('WebGL 不可用。');
-    return new WebGlRenderer(canvas, gl);
+    return new WebGlRenderer(canvas, gl, diagnostics);
   }
 
   // 构造阶段创建并缓存所有可以跨帧复用的 WebGL 资源。
-  constructor(canvas, gl) {
+  constructor(canvas, gl, diagnostics) {
     this.canvas = canvas;
     this.gl = gl;
+    this.diagnostics = diagnostics;
     this.name = 'WebGL';
     this.program = this._createProgram();
     this.buffer = this._createBuffer();
@@ -36,6 +37,26 @@ export class WebGlRenderer {
     gl.uniform1i(gl.getUniformLocation(this.program, 'u_alpha'), 1);
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
     gl.clearColor(0, 0, 0, 0);
+    this.diagnostics.info('webgl.context.ready', {
+      canvasSize: [canvas.width, canvas.height],
+      timerQuerySupported: this.diagnostics.enabled
+        ? Boolean(gl.getExtension('EXT_disjoint_timer_query_webgl2'))
+        : false,
+    });
+  }
+
+  get isAvailable() {
+    return !this.destroyed && !this.gl.isContextLost();
+  }
+
+  resize(width, height) {
+    if (!this.isAvailable) throw new Error('WebGL Renderer 不可用。');
+    if (this.canvas.width === width && this.canvas.height === height) return;
+    this.canvas.width = width;
+    this.canvas.height = height;
+    this._resizeTexture(this.gl.TEXTURE0, this.colorTexture, width, height);
+    this._resizeTexture(this.gl.TEXTURE1, this.alphaTexture, width, height);
+    this.diagnostics.info('webgl.canvas.resized', { canvasSize: [width, height] });
   }
 
   /**
@@ -46,7 +67,7 @@ export class WebGlRenderer {
    * WebGPU importExternalTexture() 更广。该方法完成后 Player 即可关闭帧。
    */
   async render(pair) {
-    if (this.destroyed) throw new Error('WebGL Renderer 已释放。');
+    if (!this.isAvailable) throw new Error('WebGL Renderer 不可用。');
     const gl = this.gl;
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
 
@@ -64,6 +85,14 @@ export class WebGlRenderer {
     gl.drawArrays(gl.TRIANGLES, 0, 6);
   }
 
+  async clear() {
+    if (!this.isAvailable) return;
+    const gl = this.gl;
+    gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.flush();
+  }
+
   _uploadFrame(unit, texture, frame) {
     const gl = this.gl;
     gl.activeTexture(unit);
@@ -79,10 +108,30 @@ export class WebGlRenderer {
     );
   }
 
+  _resizeTexture(unit, texture, width, height) {
+    const gl = this.gl;
+    gl.activeTexture(unit);
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.texImage2D(
+      gl.TEXTURE_2D,
+      0,
+      gl.RGBA,
+      width,
+      height,
+      0,
+      gl.RGBA,
+      gl.UNSIGNED_BYTE,
+      null
+    );
+  }
+
   // 显式删除由本 Renderer 创建的 WebGL 对象。
   destroy() {
     if (this.destroyed) return;
     this.destroyed = true;
+    this.diagnostics.info('webgl.destroy.begin', {
+      canvasSize: [this.canvas.width, this.canvas.height],
+    });
     const gl = this.gl;
     gl.finish();
     gl.deleteTexture(this.colorTexture);
@@ -90,6 +139,7 @@ export class WebGlRenderer {
     gl.deleteBuffer(this.buffer);
     gl.deleteProgram(this.program);
     gl.getExtension('WEBGL_lose_context')?.loseContext();
+    this.diagnostics.info('webgl.destroy.complete');
   }
 
   /**

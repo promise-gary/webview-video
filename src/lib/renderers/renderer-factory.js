@@ -21,14 +21,20 @@ export class RendererFactory {
    * @param {{ webGpuEnabled?: boolean }} options 渲染后端开关。
    * @returns {Promise<WebGpuRenderer | WebGlRenderer>}
    */
-  static async create(canvas, { webGpuEnabled = true } = {}) {
+  static async create(canvas, { webGpuEnabled = true, diagnostics } = {}) {
     let webGpuError = null;
 
     if (webGpuEnabled && navigator.gpu) {
       try {
-        return await WebGpuRenderer.create(canvas);
+        diagnostics.info('renderer.webgpu.create.begin', {
+          canvasSize: [canvas.width, canvas.height],
+        });
+        return await WebGpuRenderer.create(canvas, { diagnostics });
       } catch (error) {
         webGpuError = error;
+        diagnostics.error('renderer.webgpu.create.failed', error, {
+          canvasSize: [canvas.width, canvas.height],
+        });
         /**
          * 一个 Canvas 一旦成功调用 getContext('webgpu')，就不能再对同一个
          * Canvas 获取 webgl context。WebGPU 可能在创建 context 之后、创建
@@ -38,11 +44,19 @@ export class RendererFactory {
       }
     } else if (webGpuEnabled) {
       webGpuError = new Error('navigator.gpu 不存在');
+      diagnostics.warn('renderer.webgpu.unavailable');
     }
 
     try {
-      return WebGlRenderer.create(canvas);
+      diagnostics.info('renderer.webgl.create.begin', {
+        canvasSize: [canvas.width, canvas.height],
+        webGpuError: webGpuError?.message ?? '',
+      });
+      return WebGlRenderer.create(canvas, { diagnostics });
     } catch (webGlError) {
+      diagnostics.error('renderer.webgl.create.failed', webGlError, {
+        webGpuError: webGpuError?.message ?? '',
+      });
       const webGpuMessage = webGpuEnabled
         ? webGpuError?.message ?? '当前环境没有 WebGPU'
         : '已通过配置关闭';
