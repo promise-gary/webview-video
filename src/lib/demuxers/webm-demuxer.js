@@ -9,6 +9,7 @@ const ID = Object.freeze({
   SEGMENT: 0x18538067,
   INFO: 0x1549a966,
   TIMECODE_SCALE: 0x2ad7b1,
+  DURATION: 0x4489,
 
   // Tracks 下每条音视频轨共用的元数据。
   TRACKS: 0x1654ae6b,
@@ -114,6 +115,7 @@ export class WebmDemuxer {
     if (!info || !tracks) throw new Error('WebM 缺少 Info 或 Tracks。');
 
     const timecodeScaleNs = this._readTimecodeScale(bytes, info);
+    const mediaDurationUs = this._readDurationUs(bytes, info, timecodeScaleNs);
     const { videoTrack, audioTrack } = this._readTracks(bytes, tracks, audioEnabled);
     // 第二阶段遍历全部 Cluster，把交织存储的音视频压缩块分别放入两个时间轴。
     const frames = [];
@@ -141,13 +143,13 @@ export class WebmDemuxer {
     }
 
     // WebCodecs chunk 最好带 duration；容器未写时根据下一个 timestamp 推导。
-    this._fillFrameDurations(frames);
+    this._fillFrameDurations(frames, mediaDurationUs);
     if (audioChunks) this._fillChunkDurations(audioChunks, FALLBACK_AUDIO_DURATION_US);
     return {
       frames,
       width: videoTrack.width,
       height: videoTrack.height,
-      duration: frames.at(-1).timestamp + frames.at(-1).duration,
+      duration: mediaDurationUs ?? frames.at(-1).timestamp + frames.at(-1).duration,
       codec: 'vp09.00.40.08',
       audio: audioTrack
         ? {
@@ -181,6 +183,17 @@ export class WebmDemuxer {
       if (element.id === ID.TIMECODE_SCALE) return this._readUnsigned(bytes, element);
     }
     return DEFAULT_TIMECODE_SCALE_NS;
+  }
+
+  // Info.Duration 的单位是 TimecodeScale，存在时可精确补齐最后一帧的时长。
+  static _readDurationUs(bytes, info, timecodeScaleNs) {
+    for (const element of this._children(bytes, info)) {
+      if (element.id !== ID.DURATION) continue;
+      const durationTicks = this._readFloat(bytes, element);
+      if (!Number.isFinite(durationTicks) || durationTicks <= 0) return null;
+      return this._toMicroseconds(durationTicks, timecodeScaleNs);
+    }
+    return null;
   }
 
   // 读取本 Demo 支持的唯一 VP9 Alpha 视频轨，以及可选的唯一 Opus 音频轨。
@@ -459,8 +472,8 @@ export class WebmDemuxer {
    * IVF/WebM 都不直接为最后一帧提供可靠 duration。
    * 优先保留 BlockDuration，其余帧用下一帧时间戳之差，最后一帧使用中位数。
    */
-  static _fillFrameDurations(frames) {
-    this._fillChunkDurations(frames, FALLBACK_FRAME_DURATION_US);
+  static _fillFrameDurations(frames, mediaDurationUs) {
+    this._fillChunkDurations(frames, FALLBACK_FRAME_DURATION_US, mediaDurationUs);
   }
 
   /**
@@ -468,7 +481,7 @@ export class WebmDemuxer {
    * 最后一块没有“下一块”可参考，因此使用前面 duration 的中位数；中位数不会
    * 被偶发的大时间间隔明显拉偏。
    */
-  static _fillChunkDurations(chunks, fallbackDurationUs) {
+  static _fillChunkDurations(chunks, fallbackDurationUs, mediaDurationUs = null) {
     if (!chunks.length) return;
     const durations = [];
     for (let index = 0; index < chunks.length - 1; index += 1) {
@@ -477,8 +490,12 @@ export class WebmDemuxer {
     }
 
     durations.sort((left, right) => left - right);
-    if (!chunks.at(-1).duration) {
-      chunks.at(-1).duration = durations.length
+    const lastChunk = chunks.at(-1);
+    if (!lastChunk.duration && mediaDurationUs && mediaDurationUs > lastChunk.timestamp) {
+      lastChunk.duration = mediaDurationUs - lastChunk.timestamp;
+    }
+    if (!lastChunk.duration) {
+      lastChunk.duration = durations.length
         ? durations[Math.floor(durations.length / 2)]
         : fallbackDurationUs;
     }
