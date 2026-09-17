@@ -1,4 +1,3 @@
-import { FetchStreamRequest } from '../../network/fetch-stream-request.js';
 import { TransparentWebmPlayer } from './transparent-webm-player.js';
 
 const NOOP = () => {};
@@ -9,6 +8,7 @@ export class SerialVideoController {
     canvas,
     canvasHost,
     resources,
+    resourceLoader,
     errorHandler,
     diagnostics,
     playerOptions = {},
@@ -20,6 +20,7 @@ export class SerialVideoController {
     this.canvas = canvas;
     this.canvasHost = canvasHost;
     this.resources = resources;
+    this.resourceLoader = resourceLoader;
     this.errorHandler = errorHandler;
     this.diagnostics = diagnostics;
     this.playerOptions = playerOptions;
@@ -123,32 +124,24 @@ export class SerialVideoController {
   async _playOne(resource, generation) {
     const abortController = new AbortController();
     this.abortController = abortController;
-    this.onDownloadProgress({
-      fileName: resource.fileName,
-      loadedBytes: 0,
-      totalBytes: 0,
-      complete: false,
-    });
     this.diagnostics.info('download.begin', { generation, fileName: resource.fileName });
 
-    const request = new FetchStreamRequest({
-      sourceUrl: resource.url,
+    const media = await this.resourceLoader.load(resource, {
       signal: abortController.signal,
-      diagnostics: this.diagnostics,
-      fileName: resource.fileName,
       onProgress: (progress) => {
         if (this._isCurrent(generation)) {
           this.onDownloadProgress({ fileName: resource.fileName, ...progress });
         }
       },
     });
-    const mediaBuffer = await request.download();
+    const mediaBuffer = media.buffer;
     if (!this._isCurrent(generation)) return;
     this.abortController = null;
     this.diagnostics.info('download.complete', {
       generation,
       fileName: resource.fileName,
       bytes: mediaBuffer.byteLength,
+      source: media.source,
     });
     this.diagnostics.sampleMemory('download.complete', {
       generation,

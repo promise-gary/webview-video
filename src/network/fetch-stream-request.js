@@ -115,7 +115,11 @@ export class FetchStreamRequest {
       loadedBytes,
       totalBytes,
     });
-    return mediaBytes.buffer;
+    return {
+      buffer: mediaBytes.buffer,
+      byteLength: mediaBytes.byteLength,
+      contentType: response.headers.get('Content-Type') ?? 'video/webm',
+    };
   }
 
   _logProgress(loadedBytes, totalBytes) {

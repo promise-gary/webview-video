@@ -19,16 +19,20 @@ export class PlayerDebugPanel {
     }
   }
 
-  updateDownload({ fileName, loadedBytes, totalBytes, complete }) {
+  updateDownload({ fileName, loadedBytes, totalBytes, complete, source }) {
     if (!this.enabled) return;
     if (!totalBytes) {
       this.rendererName = '初始化中';
       this.videoInfo = null;
       this.debugInfo.classList.remove('error');
-      this.debugInfo.textContent = `正在下载 ${fileName}…`;
+      this.debugInfo.textContent = source === 'cache'
+        ? `正在读取缓存 ${fileName}…`
+        : `正在下载 ${fileName}…`;
       this.downloadProgress.value = 0;
       this.downloadProgress.textContent = '0%';
-      this.downloadDetail.textContent = `${fileName} · 等待下载…`;
+      this.downloadDetail.textContent = source === 'cache'
+        ? `${fileName} · 正在检查缓存…`
+        : `${fileName} · 等待下载…`;
       return;
     }
 
@@ -36,7 +40,8 @@ export class PlayerDebugPanel {
     this.downloadProgress.value = percent;
     this.downloadProgress.textContent = `${percent.toFixed(1)}%`;
     this.downloadDetail.textContent = complete
-      ? `${fileName} · ${PlayerDebugPanel._formatBytes(totalBytes)} · 已完成`
+      ? `${fileName} · ${PlayerDebugPanel._formatBytes(totalBytes)}`
+        + ` · ${source === 'cache' ? '缓存命中' : '下载完成'}`
       : `${fileName} · ${PlayerDebugPanel._formatBytes(loadedBytes)}`
         + ` / ${PlayerDebugPanel._formatBytes(totalBytes)} · ${percent.toFixed(1)}%`;
   }
